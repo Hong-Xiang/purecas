@@ -119,17 +119,76 @@ fn main() -> anyhow::Result<()> {
     let root = resolve_root(cli.root)?;
 
     match cli.command {
-        Commands::Add { files } => todo!(),
+        Commands::Add { files } => {
+            let conn = db::open_db(&root)?;
+            for file in &files {
+                let hash = store::store_blob(&root, file)?;
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                db::insert_blob(&conn, &hash)?;
+                if !name.is_empty() {
+                    db::insert_blob_name(&conn, &hash, &name)?;
+                }
+                println!("{} {}", hash, name);
+            }
+            Ok(())
+        }
         Commands::Fetch { url, sha256, unzip } => todo!(),
-        Commands::Path { hash } => todo!(),
-        Commands::Cat { hash } => todo!(),
-        Commands::Pkg { command } => match command {
-            PkgCommands::Create { name, description } => todo!(),
-            PkgCommands::Add { name, hashes, path } => todo!(),
-            PkgCommands::List => todo!(),
-            PkgCommands::Show { name } => todo!(),
-            PkgCommands::Rm { name } => todo!(),
-        },
+        Commands::Path { hash } => {
+            let p = store::blob_path(&root, &hash);
+            let status = if p.exists() { "[exists]" } else { "[missing]" };
+            println!("{} {}", p.display(), status);
+            Ok(())
+        }
+        Commands::Cat { hash } => {
+            store::cat_blob(&root, &hash)
+        }
+        Commands::Pkg { command } => {
+            let conn = db::open_db(&root)?;
+            match command {
+                PkgCommands::Create { name, description } => {
+                    db::create_package(&conn, &name, description.as_deref())?;
+                    println!("Created package: {}", name);
+                    Ok(())
+                }
+                PkgCommands::Add { name, hashes, path } => {
+                    if path.is_some() && hashes.len() > 1 {
+                        anyhow::bail!("--path can only be used with a single hash");
+                    }
+                    for hash in &hashes {
+                        db::add_blob_to_package(&conn, &name, hash, path.as_deref())?;
+                    }
+                    Ok(())
+                }
+                PkgCommands::List => {
+                    let pkgs = db::list_packages(&conn)?;
+                    for (name, count) in pkgs {
+                        println!("{}\t{} blobs", name, count);
+                    }
+                    Ok(())
+                }
+                PkgCommands::Show { name } => {
+                    let blobs = db::show_package(&conn, &name)?;
+                    for (hash, path, names) in blobs {
+                        let path_str = path.as_deref().unwrap_or("-");
+                        let names_str = if names.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", names.join(", "))
+                        };
+                        println!("{}\t{}{}", hash, path_str, names_str);
+                    }
+                    Ok(())
+                }
+                PkgCommands::Rm { name } => {
+                    db::remove_package(&conn, &name)?;
+                    println!("Removed package: {}", name);
+                    Ok(())
+                }
+            }
+        }
         Commands::Export { targets, to } => todo!(),
         Commands::Import { from } => todo!(),
     }
