@@ -1,0 +1,49 @@
+{
+  description = "purecas — content-addressable storage for datasets and model weights";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, crane, rust-overlay, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      };
+      rustToolchain = pkgs.rust-bin.stable.latest.default;
+      craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+      src = craneLib.cleanCargoSource ./.;
+
+      commonArgs = {
+        inherit src;
+        strictDeps = true;
+        nativeBuildInputs = with pkgs; [ pkg-config ];
+        buildInputs = with pkgs; [ openssl ];
+      };
+
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+      pcas = craneLib.buildPackage (commonArgs // {
+        inherit cargoArtifacts;
+      });
+    in
+    {
+      packages.${system}.default = pcas;
+
+      devShells.${system}.default = craneLib.devShell {
+        packages = with pkgs; [
+          rust-analyzer
+          pkg-config
+          openssl
+        ];
+      };
+    };
+}
