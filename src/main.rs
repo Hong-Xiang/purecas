@@ -135,7 +135,27 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Commands::Fetch { url, sha256, unzip } => todo!(),
+        Commands::Fetch { url, sha256, unzip } => {
+            let conn = db::open_db(&root)?;
+            if unzip {
+                let results = fetch::fetch_unzip_and_store(&url, &sha256, &root)?;
+                for (hash, name) in &results {
+                    db::insert_blob(&conn, hash)?;
+                    db::insert_blob_name(&conn, hash, name)?;
+                    println!("{} {}", hash, name);
+                }
+            } else {
+                let hash = fetch::fetch_and_store(&url, &sha256, &root)?;
+                db::insert_blob(&conn, &hash)?;
+                if let Some(name) = url.rsplit('/').next() {
+                    if !name.is_empty() {
+                        db::insert_blob_name(&conn, &hash, name)?;
+                    }
+                }
+                println!("{}", hash);
+            }
+            Ok(())
+        }
         Commands::Path { hash } => {
             let p = store::blob_path(&root, &hash);
             let status = if p.exists() { "[exists]" } else { "[missing]" };
