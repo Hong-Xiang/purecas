@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A blob entry in a package: (hash, logical_path, known_names).
@@ -36,6 +37,21 @@ fn init_tables(conn: &Connection) -> Result<()> {
             blob_hash TEXT NOT NULL REFERENCES blobs(hash),
             path TEXT,
             UNIQUE(package_name, blob_hash)
+        );
+        CREATE TABLE IF NOT EXISTS tags (
+            id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            UNIQUE(id, tag)
+        );
+        CREATE TABLE IF NOT EXISTS metadata (
+            id TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS blob_relations (
+            source_hash TEXT NOT NULL,
+            target_hash TEXT NOT NULL,
+            note TEXT,
+            UNIQUE(source_hash, target_hash)
         );",
     )?;
     Ok(())
@@ -159,6 +175,119 @@ pub fn get_all_blob_names(
     Ok(map)
 }
 
+// --- Tags ---
+
+/// Add a tag to a blob or package. Idempotent.
+pub fn add_tag(conn: &Connection, id: &str, tag: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tags (id, tag) VALUES (?1, ?2)",
+        [id, tag],
+    )?;
+    Ok(())
+}
+
+/// Get all tags for a blob or package.
+pub fn get_tags(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT tag FROM tags WHERE id = ?1 ORDER BY tag")?;
+    let tags = stmt
+        .query_map([id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(tags)
+}
+
+/// Get all tags as a map for a list of IDs.
+pub fn get_all_tags(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Vec<String>>> {
+    let mut map = HashMap::new();
+    for id in ids {
+        let tags = get_tags(conn, id)?;
+        if !tags.is_empty() {
+            map.insert(id.clone(), tags);
+        }
+    }
+    Ok(map)
+}
+
+// --- Metadata ---
+
+/// Set metadata string for a blob or package. Overwrites any existing value.
+pub fn set_metadata(conn: &Connection, id: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (id, value) VALUES (?1, ?2)",
+        [id, value],
+    )?;
+    Ok(())
+}
+
+/// Get metadata string for a blob or package.
+pub fn get_metadata(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let result = conn.query_row("SELECT value FROM metadata WHERE id = ?1", [id], |row| {
+        row.get(0)
+    });
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get all metadata as a map for a list of IDs.
+pub fn get_all_metadata(conn: &Connection, ids: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for id in ids {
+        if let Some(value) = get_metadata(conn, id)? {
+            map.insert(id.clone(), value);
+        }
+    }
+    Ok(map)
+}
+
+// --- Relations ---
+
+/// Add a relation between two blobs. Idempotent (overwrites note).
+pub fn add_relation(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO blob_relations (source_hash, target_hash, note) VALUES (?1, ?2, ?3)",
+        rusqlite::params![source, target, note],
+    )?;
+    Ok(())
+}
+
+/// Get all relations where the given hash is the source.
+pub fn get_relations_from(
+    conn: &Connection,
+    source: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT target_hash, note FROM blob_relations WHERE source_hash = ?1 ORDER BY target_hash",
+    )?;
+    let rows = stmt
+        .query_map([source], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Get all relations (for export).
+pub fn get_all_relations(
+    conn: &Connection,
+    hashes: &[String],
+) -> Result<Vec<(String, String, Option<String>)>> {
+    let mut results = Vec::new();
+    for hash in hashes {
+        let rels = get_relations_from(conn, hash)?;
+        for (target, note) in rels {
+            results.push((hash.clone(), target, note));
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +389,69 @@ mod tests {
         create_package(&conn, "mypkg", None).unwrap();
         add_blob_to_package(&conn, "mypkg", "hash1", Some("a.txt")).unwrap();
         add_blob_to_package(&conn, "mypkg", "hash1", Some("a.txt")).unwrap();
+    }
+
+    #[test]
+    fn test_tags() {
+        let (_dir, conn) = test_db();
+        insert_blob(&conn, "abc123").unwrap();
+        add_tag(&conn, "abc123", "dataset").unwrap();
+        add_tag(&conn, "abc123", "production").unwrap();
+        add_tag(&conn, "abc123", "dataset").unwrap(); // idempotent
+        let tags = get_tags(&conn, "abc123").unwrap();
+        assert_eq!(tags, vec!["dataset", "production"]);
+    }
+
+    #[test]
+    fn test_tags_on_package() {
+        let (_dir, conn) = test_db();
+        create_package(&conn, "mypkg", None).unwrap();
+        add_tag(&conn, "mypkg", "v1").unwrap();
+        add_tag(&conn, "mypkg", "stable").unwrap();
+        let mut tags = get_tags(&conn, "mypkg").unwrap();
+        tags.sort();
+        assert_eq!(tags, vec!["stable", "v1"]);
+    }
+
+    #[test]
+    fn test_metadata() {
+        let (_dir, conn) = test_db();
+        insert_blob(&conn, "abc123").unwrap();
+        assert_eq!(get_metadata(&conn, "abc123").unwrap(), None);
+        set_metadata(&conn, "abc123", "trained on ImageNet").unwrap();
+        assert_eq!(
+            get_metadata(&conn, "abc123").unwrap(),
+            Some("trained on ImageNet".to_string())
+        );
+        // overwrite
+        set_metadata(&conn, "abc123", "updated note").unwrap();
+        assert_eq!(
+            get_metadata(&conn, "abc123").unwrap(),
+            Some("updated note".to_string())
+        );
+    }
+
+    #[test]
+    fn test_relations() {
+        let (_dir, conn) = test_db();
+        insert_blob(&conn, "model_v1").unwrap();
+        insert_blob(&conn, "model_v2").unwrap();
+        insert_blob(&conn, "dataset_a").unwrap();
+        add_relation(&conn, "model_v2", "model_v1", Some("derived from")).unwrap();
+        add_relation(&conn, "model_v2", "dataset_a", Some("trained on")).unwrap();
+        let rels = get_relations_from(&conn, "model_v2").unwrap();
+        assert_eq!(rels.len(), 2);
+        assert!(rels.contains(&("dataset_a".to_string(), Some("trained on".to_string()))));
+        assert!(rels.contains(&("model_v1".to_string(), Some("derived from".to_string()))));
+    }
+
+    #[test]
+    fn test_relation_no_note() {
+        let (_dir, conn) = test_db();
+        insert_blob(&conn, "a").unwrap();
+        insert_blob(&conn, "b").unwrap();
+        add_relation(&conn, "a", "b", None).unwrap();
+        let rels = get_relations_from(&conn, "a").unwrap();
+        assert_eq!(rels, vec![("b".to_string(), None)]);
     }
 }

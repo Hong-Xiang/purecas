@@ -28,6 +28,12 @@ enum Commands {
         /// Files to add
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Tags to apply to all added blobs (repeatable)
+        #[arg(long = "tag", num_args = 1)]
+        tags: Vec<String>,
+        /// Metadata string to set on all added blobs
+        #[arg(long = "meta")]
+        meta: Option<String>,
     },
     /// Fetch a URL, verify hash, and store in CAS
     Fetch {
@@ -69,6 +75,30 @@ enum Commands {
         /// Source directory
         #[arg(long)]
         from: PathBuf,
+    },
+    /// Add tags to a blob or package
+    Tag {
+        /// Blob hash or package name
+        id: String,
+        /// Tags to add
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Set metadata string on a blob or package
+    Meta {
+        /// Blob hash or package name
+        id: String,
+        /// Metadata value
+        value: String,
+    },
+    /// Add a relation between two blobs
+    Rel {
+        /// Source blob hash
+        source: String,
+        /// Target blob hash
+        target: String,
+        /// Optional note describing the relation
+        note: Option<String>,
     },
 }
 
@@ -123,7 +153,7 @@ fn main() -> anyhow::Result<()> {
     let root = resolve_root(cli.root)?;
 
     match cli.command {
-        Commands::Add { files } => {
+        Commands::Add { files, tags, meta } => {
             let conn = db::open_db(&root)?;
             for file in &files {
                 let hash = store::store_blob(&root, file)?;
@@ -134,6 +164,12 @@ fn main() -> anyhow::Result<()> {
                 db::insert_blob(&conn, &hash)?;
                 if !name.is_empty() {
                     db::insert_blob_name(&conn, &hash, &name)?;
+                }
+                for tag in &tags {
+                    db::add_tag(&conn, &hash, tag)?;
+                }
+                if let Some(ref m) = meta {
+                    db::set_metadata(&conn, &hash, m)?;
                 }
                 println!("{} {}", hash, name);
             }
@@ -231,6 +267,34 @@ fn main() -> anyhow::Result<()> {
                 result.imported_blobs,
                 from.display()
             );
+            Ok(())
+        }
+        Commands::Tag { id, tags } => {
+            let conn = db::open_db(&root)?;
+            for tag in &tags {
+                db::add_tag(&conn, &id, tag)?;
+            }
+            let all_tags = db::get_tags(&conn, &id)?;
+            println!("{}: {}", id, all_tags.join("; "));
+            Ok(())
+        }
+        Commands::Meta { id, value } => {
+            let conn = db::open_db(&root)?;
+            db::set_metadata(&conn, &id, &value)?;
+            println!("{}: {}", id, value);
+            Ok(())
+        }
+        Commands::Rel {
+            source,
+            target,
+            note,
+        } => {
+            let conn = db::open_db(&root)?;
+            db::add_relation(&conn, &source, &target, note.as_deref())?;
+            match &note {
+                Some(n) => println!("{} -> {} ({})", source, target, n),
+                None => println!("{} -> {}", source, target),
+            }
             Ok(())
         }
     }

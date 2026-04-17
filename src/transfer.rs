@@ -12,6 +12,19 @@ use crate::{db, store};
 pub struct ExportMetadata {
     pub packages: Vec<ExportPackage>,
     pub blob_names: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tags: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<ExportRelation>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExportRelation {
+    pub source: String,
+    pub target: String,
+    pub note: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,6 +69,18 @@ pub fn export_package(conn: &Connection, root: &Path, package: &str, to: &Path) 
         .collect();
 
     let blob_names = db::get_all_blob_names(conn, &hashes)?;
+    let mut all_ids: Vec<String> = hashes.clone();
+    all_ids.push(package.to_string());
+    let tags = db::get_all_tags(conn, &all_ids)?;
+    let meta = db::get_all_metadata(conn, &all_ids)?;
+    let relations = db::get_all_relations(conn, &hashes)?
+        .into_iter()
+        .map(|(s, t, n)| ExportRelation {
+            source: s,
+            target: t,
+            note: n,
+        })
+        .collect();
 
     let metadata = ExportMetadata {
         packages: vec![ExportPackage {
@@ -64,6 +89,9 @@ pub fn export_package(conn: &Connection, root: &Path, package: &str, to: &Path) 
             blobs: export_blobs,
         }],
         blob_names,
+        tags,
+        metadata: meta,
+        relations,
     };
 
     write_export_metadata(to, &metadata)?;
@@ -77,10 +105,24 @@ pub fn export_hashes(conn: &Connection, root: &Path, hashes: &[String], to: &Pat
     }
 
     let blob_names = db::get_all_blob_names(conn, hashes)?;
+    let hash_list: Vec<String> = hashes.to_vec();
+    let tags = db::get_all_tags(conn, &hash_list)?;
+    let meta = db::get_all_metadata(conn, &hash_list)?;
+    let relations = db::get_all_relations(conn, &hash_list)?
+        .into_iter()
+        .map(|(s, t, n)| ExportRelation {
+            source: s,
+            target: t,
+            note: n,
+        })
+        .collect();
 
     let metadata = ExportMetadata {
         packages: vec![],
         blob_names,
+        tags,
+        metadata: meta,
+        relations,
     };
 
     write_export_metadata(to, &metadata)?;
@@ -141,6 +183,23 @@ pub fn import_from(conn: &Connection, root: &Path, from: &Path) -> Result<Import
             for name in names {
                 db::insert_blob_name(conn, hash, name)?;
             }
+        }
+
+        for (id, tags) in &metadata.tags {
+            for tag in tags {
+                db::add_tag(conn, id, tag)?;
+            }
+        }
+
+        for (id, value) in &metadata.metadata {
+            // Only set if not already present (merge semantics)
+            if db::get_metadata(conn, id)?.is_none() {
+                db::set_metadata(conn, id, value)?;
+            }
+        }
+
+        for rel in &metadata.relations {
+            db::add_relation(conn, &rel.source, &rel.target, rel.note.as_deref())?;
         }
 
         for pkg in &metadata.packages {

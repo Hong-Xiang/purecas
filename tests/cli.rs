@@ -407,3 +407,175 @@ fn test_export_import_roundtrip() {
         .success()
         .stdout(predicate::str::contains(hash));
 }
+
+#[test]
+fn test_tag_blob() {
+    let root = cas_root();
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("data.bin");
+    fs::write(&file, b"tag test").unwrap();
+
+    let output = pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hash = stdout.split_whitespace().next().unwrap();
+
+    pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "tag",
+            hash,
+            "dataset",
+            "production",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dataset"))
+        .stdout(predicate::str::contains("production"));
+}
+
+#[test]
+fn test_meta_blob() {
+    let root = cas_root();
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("data.bin");
+    fs::write(&file, b"meta test").unwrap();
+
+    let output = pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hash = stdout.split_whitespace().next().unwrap();
+
+    pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "meta",
+            hash,
+            "trained on ImageNet v2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("trained on ImageNet v2"));
+}
+
+#[test]
+fn test_add_with_tag_and_meta() {
+    let root = cas_root();
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("model.pth");
+    fs::write(&file, b"model weights").unwrap();
+
+    pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+            "--tag",
+            "model",
+            "--tag",
+            "v1",
+            "--meta",
+            "ResNet50 checkpoint",
+        ])
+        .assert()
+        .success();
+
+    let output = pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hash = stdout.split_whitespace().next().unwrap();
+
+    // Verify tags were set
+    pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "tag",
+            hash,
+            "check",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model"))
+        .stdout(predicate::str::contains("v1"));
+}
+
+#[test]
+fn test_rel() {
+    let root = cas_root();
+    let src = TempDir::new().unwrap();
+    let file1 = src.path().join("v1.bin");
+    let file2 = src.path().join("v2.bin");
+    fs::write(&file1, b"version 1").unwrap();
+    fs::write(&file2, b"version 2").unwrap();
+
+    let out1 = pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file1.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let hash1 = String::from_utf8(out1.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    let out2 = pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file2.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let hash2 = String::from_utf8(out2.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "rel",
+            &hash2,
+            &hash1,
+            "derived from",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("->"))
+        .stdout(predicate::str::contains("derived from"));
+}
