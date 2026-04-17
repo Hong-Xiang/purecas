@@ -182,3 +182,101 @@ fn test_pkg_rm() {
         .success()
         .stdout(predicate::str::is_empty().or(predicate::str::contains("mypkg").not()));
 }
+
+#[test]
+fn test_export_package_cli() {
+    let root = cas_root();
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("data.bin");
+    fs::write(&file, b"export test data").unwrap();
+
+    let output = pcas()
+        .args(["--root", root.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hash = stdout.split_whitespace().next().unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap(), "pkg", "create", "testpkg"])
+        .assert()
+        .success();
+    pcas()
+        .args(["--root", root.path().to_str().unwrap(), "pkg", "add", "testpkg", hash])
+        .assert()
+        .success();
+
+    let export_dir = TempDir::new().unwrap();
+    pcas()
+        .args([
+            "--root", root.path().to_str().unwrap(),
+            "export", "testpkg",
+            "--to", export_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Exported package"));
+
+    let blob_file = export_dir.path().join("sha256").join(&hash[..2]).join(hash);
+    assert!(blob_file.exists());
+
+    let meta_file = export_dir.path().join("purecas-export.json");
+    assert!(meta_file.exists());
+}
+
+#[test]
+fn test_export_import_roundtrip() {
+    let root1 = cas_root();
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("roundtrip.txt");
+    fs::write(&file, b"roundtrip content").unwrap();
+
+    let output = pcas()
+        .args(["--root", root1.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hash = stdout.split_whitespace().next().unwrap();
+
+    pcas()
+        .args(["--root", root1.path().to_str().unwrap(), "pkg", "create", "rtpkg"])
+        .assert()
+        .success();
+    pcas()
+        .args(["--root", root1.path().to_str().unwrap(), "pkg", "add", "rtpkg", hash])
+        .assert()
+        .success();
+
+    let export_dir = TempDir::new().unwrap();
+    pcas()
+        .args([
+            "--root", root1.path().to_str().unwrap(),
+            "export", "rtpkg",
+            "--to", export_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let root2 = cas_root();
+    pcas()
+        .args([
+            "--root", root2.path().to_str().unwrap(),
+            "import",
+            "--from", export_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported"));
+
+    pcas()
+        .args(["--root", root2.path().to_str().unwrap(), "path", hash])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[exists]"));
+
+    pcas()
+        .args(["--root", root2.path().to_str().unwrap(), "pkg", "show", "rtpkg"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(hash));
+}
