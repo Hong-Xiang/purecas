@@ -117,8 +117,8 @@ pub fn import_from(conn: &Connection, root: &Path, from: &Path) -> Result<Import
             for blob_entry in fs::read_dir(prefix_entry.path())? {
                 let blob_entry = blob_entry?;
                 let hash = blob_entry.file_name().to_string_lossy().to_string();
-                let dest = store::blob_path(root, &hash);
-                if !dest.exists() {
+                if !store::blob_exists(root, &hash) {
+                    let dest = store::blob_path(root, &hash);
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -187,13 +187,18 @@ mod tests {
         let export_dir = TempDir::new().unwrap();
         export_package(&conn, root.path(), "testpkg", export_dir.path()).unwrap();
 
-        let exported_blob = export_dir.path().join("sha256").join(&hash[..2]).join(&hash);
+        let exported_blob = export_dir
+            .path()
+            .join("sha256")
+            .join(&hash[..2])
+            .join(&hash);
         assert!(exported_blob.exists());
         assert_eq!(fs::read(&exported_blob).unwrap(), b"export me");
 
         let meta_path = export_dir.path().join(EXPORT_FILENAME);
         assert!(meta_path.exists());
-        let meta: ExportMetadata = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let meta: ExportMetadata =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert_eq!(meta.packages.len(), 1);
         assert_eq!(meta.packages[0].name, "testpkg");
         assert_eq!(meta.packages[0].blobs.len(), 1);
@@ -208,12 +213,17 @@ mod tests {
         let export_dir = TempDir::new().unwrap();
         export_hashes(&conn, root.path(), &[hash.clone()], export_dir.path()).unwrap();
 
-        let exported_blob = export_dir.path().join("sha256").join(&hash[..2]).join(&hash);
+        let exported_blob = export_dir
+            .path()
+            .join("sha256")
+            .join(&hash[..2])
+            .join(&hash);
         assert!(exported_blob.exists());
 
         let meta: ExportMetadata = serde_json::from_str(
-            &fs::read_to_string(export_dir.path().join(EXPORT_FILENAME)).unwrap()
-        ).unwrap();
+            &fs::read_to_string(export_dir.path().join(EXPORT_FILENAME)).unwrap(),
+        )
+        .unwrap();
         assert!(meta.packages.is_empty());
         assert!(meta.blob_names.contains_key(&hash));
     }

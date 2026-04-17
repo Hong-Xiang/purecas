@@ -2,13 +2,16 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
-mod store;
 mod db;
 mod fetch;
+mod store;
 mod transfer;
 
 #[derive(Parser)]
-#[command(name = "pcas", about = "Content-addressable storage for datasets and model weights")]
+#[command(
+    name = "pcas",
+    about = "Content-addressable storage for datasets and model weights"
+)]
 struct Cli {
     /// Override CAS root directory (default: $CAS_ROOT or ~/data/blob)
     #[arg(long)]
@@ -163,9 +166,7 @@ fn main() -> anyhow::Result<()> {
             println!("{} {}", p.display(), status);
             Ok(())
         }
-        Commands::Cat { hash } => {
-            store::cat_blob(&root, &hash)
-        }
+        Commands::Cat { hash } => store::cat_blob(&root, &hash),
         Commands::Pkg { command } => {
             let conn = db::open_db(&root)?;
             match command {
@@ -225,7 +226,11 @@ fn main() -> anyhow::Result<()> {
         Commands::Import { from } => {
             let conn = db::open_db(&root)?;
             let result = transfer::import_from(&conn, &root, &from)?;
-            println!("Imported {} blob(s) from {}", result.imported_blobs, from.display());
+            println!(
+                "Imported {} blob(s) from {}",
+                result.imported_blobs,
+                from.display()
+            );
             Ok(())
         }
     }

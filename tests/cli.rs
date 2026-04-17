@@ -18,10 +18,17 @@ fn test_add_single_file() {
     let file = src.path().join("hello.txt");
     fs::write(&file, b"hello world").unwrap();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"))
+        .stdout(predicate::str::contains(
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        ))
         .stdout(predicate::str::contains("hello.txt"));
 }
 
@@ -33,7 +40,8 @@ fn test_add_multiple_files() {
     fs::write(src.path().join("b.txt"), b"bbb").unwrap();
     pcas()
         .args([
-            "--root", root.path().to_str().unwrap(),
+            "--root",
+            root.path().to_str().unwrap(),
             "add",
             src.path().join("a.txt").to_str().unwrap(),
             src.path().join("b.txt").to_str().unwrap(),
@@ -51,7 +59,12 @@ fn test_path_exists() {
     let file = src.path().join("hello.txt");
     fs::write(&file, b"hello world").unwrap();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
         .assert()
         .success();
     let hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -80,7 +93,12 @@ fn test_cat_existing_blob() {
     let file = src.path().join("hello.txt");
     fs::write(&file, b"hello world").unwrap();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
         .assert()
         .success();
     let hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -105,7 +123,15 @@ fn test_cat_missing_blob() {
 fn test_pkg_create_and_list() {
     let root = cas_root();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "create", "mydata", "--description", "A test dataset"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "create",
+            "mydata",
+            "--description",
+            "A test dataset",
+        ])
         .assert()
         .success();
     pcas()
@@ -124,24 +150,50 @@ fn test_pkg_add_and_show() {
     fs::write(&file, b"binary data").unwrap();
 
     let output = pcas()
-        .args(["--root", root.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let hash = stdout.split_whitespace().next().unwrap();
 
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "create", "mypkg"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "create",
+            "mypkg",
+        ])
         .assert()
         .success();
 
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "add", "mypkg", hash, "--path", "data/data.bin"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "add",
+            "mypkg",
+            hash,
+            "--path",
+            "data/data.bin",
+        ])
         .assert()
         .success();
 
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "show", "mypkg"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "show",
+            "mypkg",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains(hash))
@@ -152,13 +204,26 @@ fn test_pkg_add_and_show() {
 fn test_pkg_add_multiple_hashes_with_path_errors() {
     let root = cas_root();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "create", "mypkg"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "create",
+            "mypkg",
+        ])
         .assert()
         .success();
     pcas()
         .args([
-            "--root", root.path().to_str().unwrap(),
-            "pkg", "add", "mypkg", "hash1", "hash2", "--path", "somepath",
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "add",
+            "mypkg",
+            "hash1",
+            "hash2",
+            "--path",
+            "somepath",
         ])
         .assert()
         .failure()
@@ -169,11 +234,23 @@ fn test_pkg_add_multiple_hashes_with_path_errors() {
 fn test_pkg_rm() {
     let root = cas_root();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "create", "mypkg"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "create",
+            "mypkg",
+        ])
         .assert()
         .success();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "rm", "mypkg"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "rm",
+            "mypkg",
+        ])
         .assert()
         .success();
     pcas()
@@ -191,27 +268,48 @@ fn test_export_package_cli() {
     fs::write(&file, b"export test data").unwrap();
 
     let output = pcas()
-        .args(["--root", root.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let hash = stdout.split_whitespace().next().unwrap();
 
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "create", "testpkg"])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "create",
+            "testpkg",
+        ])
         .assert()
         .success();
     pcas()
-        .args(["--root", root.path().to_str().unwrap(), "pkg", "add", "testpkg", hash])
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "pkg",
+            "add",
+            "testpkg",
+            hash,
+        ])
         .assert()
         .success();
 
     let export_dir = TempDir::new().unwrap();
     pcas()
         .args([
-            "--root", root.path().to_str().unwrap(),
-            "export", "testpkg",
-            "--to", export_dir.path().to_str().unwrap(),
+            "--root",
+            root.path().to_str().unwrap(),
+            "export",
+            "testpkg",
+            "--to",
+            export_dir.path().to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -232,27 +330,48 @@ fn test_export_import_roundtrip() {
     fs::write(&file, b"roundtrip content").unwrap();
 
     let output = pcas()
-        .args(["--root", root1.path().to_str().unwrap(), "add", file.to_str().unwrap()])
+        .args([
+            "--root",
+            root1.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let hash = stdout.split_whitespace().next().unwrap();
 
     pcas()
-        .args(["--root", root1.path().to_str().unwrap(), "pkg", "create", "rtpkg"])
+        .args([
+            "--root",
+            root1.path().to_str().unwrap(),
+            "pkg",
+            "create",
+            "rtpkg",
+        ])
         .assert()
         .success();
     pcas()
-        .args(["--root", root1.path().to_str().unwrap(), "pkg", "add", "rtpkg", hash])
+        .args([
+            "--root",
+            root1.path().to_str().unwrap(),
+            "pkg",
+            "add",
+            "rtpkg",
+            hash,
+        ])
         .assert()
         .success();
 
     let export_dir = TempDir::new().unwrap();
     pcas()
         .args([
-            "--root", root1.path().to_str().unwrap(),
-            "export", "rtpkg",
-            "--to", export_dir.path().to_str().unwrap(),
+            "--root",
+            root1.path().to_str().unwrap(),
+            "export",
+            "rtpkg",
+            "--to",
+            export_dir.path().to_str().unwrap(),
         ])
         .assert()
         .success();
@@ -260,9 +379,11 @@ fn test_export_import_roundtrip() {
     let root2 = cas_root();
     pcas()
         .args([
-            "--root", root2.path().to_str().unwrap(),
+            "--root",
+            root2.path().to_str().unwrap(),
             "import",
-            "--from", export_dir.path().to_str().unwrap(),
+            "--from",
+            export_dir.path().to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -275,7 +396,13 @@ fn test_export_import_roundtrip() {
         .stdout(predicate::str::contains("[exists]"));
 
     pcas()
-        .args(["--root", root2.path().to_str().unwrap(), "pkg", "show", "rtpkg"])
+        .args([
+            "--root",
+            root2.path().to_str().unwrap(),
+            "pkg",
+            "show",
+            "rtpkg",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains(hash));

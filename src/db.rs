@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 
+/// A blob entry in a package: (hash, logical_path, known_names).
+pub type PackageBlobEntry = (String, Option<String>, Vec<String>);
+
 /// Open (or create) the SQLite database at <root>/purecas.db.
 pub fn open_db(root: &Path) -> Result<Connection> {
     let db_path = root.join("purecas.db");
@@ -33,17 +36,14 @@ fn init_tables(conn: &Connection) -> Result<()> {
             blob_hash TEXT NOT NULL REFERENCES blobs(hash),
             path TEXT,
             UNIQUE(package_name, blob_hash)
-        );"
+        );",
     )?;
     Ok(())
 }
 
 /// Insert a blob hash into the DB. Idempotent.
 pub fn insert_blob(conn: &Connection, hash: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO blobs (hash) VALUES (?1)",
-        [hash],
-    )?;
+    conn.execute("INSERT OR IGNORE INTO blobs (hash) VALUES (?1)", [hash])?;
     Ok(())
 }
 
@@ -81,7 +81,7 @@ pub fn list_packages(conn: &Connection) -> Result<Vec<(String, usize)>> {
          FROM packages p
          LEFT JOIN package_blobs pb ON p.name = pb.package_name
          GROUP BY p.name
-         ORDER BY p.name"
+         ORDER BY p.name",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -106,12 +106,12 @@ pub fn add_blob_to_package(
 }
 
 /// Show all blobs in a package: (hash, path, known_names).
-pub fn show_package(conn: &Connection, name: &str) -> Result<Vec<(String, Option<String>, Vec<String>)>> {
+pub fn show_package(conn: &Connection, name: &str) -> Result<Vec<PackageBlobEntry>> {
     let mut stmt = conn.prepare(
         "SELECT pb.blob_hash, pb.path
          FROM package_blobs pb
          WHERE pb.package_name = ?1
-         ORDER BY pb.blob_hash"
+         ORDER BY pb.blob_hash",
     )?;
     let rows: Vec<(String, Option<String>)> = stmt
         .query_map([name], |row| {
@@ -145,7 +145,10 @@ pub fn package_exists(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 /// Get all blob_names entries as a map: hash -> Vec<name>.
-pub fn get_all_blob_names(conn: &Connection, hashes: &[String]) -> Result<std::collections::HashMap<String, Vec<String>>> {
+pub fn get_all_blob_names(
+    conn: &Connection,
+    hashes: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
     let mut map = std::collections::HashMap::new();
     for hash in hashes {
         let names = get_blob_names(conn, hash)?;
@@ -170,10 +173,14 @@ mod tests {
     #[test]
     fn test_open_db_creates_tables() {
         let (_dir, conn) = test_db();
-        conn.query_row("SELECT count(*) FROM blobs", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT count(*) FROM blob_names", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT count(*) FROM packages", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT count(*) FROM package_blobs", [], |_| Ok(())).unwrap();
+        conn.query_row("SELECT count(*) FROM blobs", [], |_| Ok(()))
+            .unwrap();
+        conn.query_row("SELECT count(*) FROM blob_names", [], |_| Ok(()))
+            .unwrap();
+        conn.query_row("SELECT count(*) FROM packages", [], |_| Ok(()))
+            .unwrap();
+        conn.query_row("SELECT count(*) FROM package_blobs", [], |_| Ok(()))
+            .unwrap();
     }
 
     #[test]
@@ -211,8 +218,12 @@ mod tests {
         create_package(&conn, "dataset-b", None).unwrap();
         let pkgs = list_packages(&conn).unwrap();
         assert_eq!(pkgs.len(), 2);
-        assert!(pkgs.iter().any(|(name, count)| name == "dataset-a" && *count == 0));
-        assert!(pkgs.iter().any(|(name, count)| name == "dataset-b" && *count == 0));
+        assert!(pkgs
+            .iter()
+            .any(|(name, count)| name == "dataset-a" && *count == 0));
+        assert!(pkgs
+            .iter()
+            .any(|(name, count)| name == "dataset-b" && *count == 0));
     }
 
     #[test]

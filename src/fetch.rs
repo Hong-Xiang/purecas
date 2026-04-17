@@ -7,8 +7,7 @@ use crate::store;
 
 /// Download a URL to a temp file in the given directory. Returns the temp file path.
 pub fn download_to_temp(url: &str, temp_dir: &Path) -> Result<std::path::PathBuf> {
-    let response = reqwest::blocking::get(url)
-        .with_context(|| format!("downloading {}", url))?;
+    let response = reqwest::blocking::get(url).with_context(|| format!("downloading {}", url))?;
     if !response.status().is_success() {
         bail!("HTTP {} for {}", response.status(), url);
     }
@@ -22,11 +21,7 @@ pub fn download_to_temp(url: &str, temp_dir: &Path) -> Result<std::path::PathBuf
 pub fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     let actual = store::hash_file(path)?;
     if actual != expected {
-        bail!(
-            "hash mismatch: expected {}, got {}",
-            expected,
-            actual
-        );
+        bail!("hash mismatch: expected {}, got {}", expected, actual);
     }
     Ok(())
 }
@@ -41,7 +36,11 @@ pub fn fetch_and_store(url: &str, expected_hash: &str, root: &Path) -> Result<St
 }
 
 /// Fetch a URL, verify SHA-256, unzip, store each file. Returns vec of (hash, filename).
-pub fn fetch_unzip_and_store(url: &str, expected_hash: &str, root: &Path) -> Result<Vec<(String, String)>> {
+pub fn fetch_unzip_and_store(
+    url: &str,
+    expected_hash: &str,
+    root: &Path,
+) -> Result<Vec<(String, String)>> {
     let temp = tempfile::tempdir()?;
     let downloaded = download_to_temp(url, temp.path())?;
     verify_hash(&downloaded, expected_hash)?;
@@ -60,7 +59,12 @@ pub fn fetch_unzip_and_store(url: &str, expected_hash: &str, root: &Path) -> Res
         }
         let name = entry
             .enclosed_name()
-            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
             .unwrap_or_default();
         if name.is_empty() {
             continue;
@@ -85,7 +89,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("test.txt");
         fs::write(&file, b"hello world").unwrap();
-        verify_hash(&file, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9").unwrap();
+        verify_hash(
+            &file,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -93,7 +101,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("test.txt");
         fs::write(&file, b"hello world").unwrap();
-        let result = verify_hash(&file, "0000000000000000000000000000000000000000000000000000000000000000");
+        let result = verify_hash(
+            &file,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("hash mismatch"));
