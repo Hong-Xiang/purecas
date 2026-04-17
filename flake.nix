@@ -33,10 +33,14 @@
 
       pcas = craneLib.buildPackage (commonArgs // {
         inherit cargoArtifacts;
+        meta.mainProgram = "pcas";
       });
     in
     {
-      packages.${system}.default = pcas;
+      packages.${system} = {
+        default = pcas;
+        pcas = pcas;
+      };
 
       devShells.${system}.default = craneLib.devShell {
         packages = with pkgs; [
