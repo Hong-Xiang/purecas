@@ -85,7 +85,10 @@ mod tests {
         let file = dir.path().join("hello.txt");
         fs::write(&file, b"hello world").unwrap();
         let hash = hash_file(&file).unwrap();
-        assert_eq!(hash, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]
@@ -117,7 +120,10 @@ mod tests {
     #[test]
     fn test_read_blob_missing() {
         let cas_root = TempDir::new().unwrap();
-        let result = read_blob(cas_root.path(), "0000000000000000000000000000000000000000000000000000000000000000");
+        let result = read_blob(
+            cas_root.path(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
         assert!(result.is_err());
     }
 }
