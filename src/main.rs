@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::path::PathBuf;
 
 mod store;
@@ -209,7 +210,23 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Export { targets, to } => todo!(),
-        Commands::Import { from } => todo!(),
+        Commands::Export { targets, to } => {
+            let conn = db::open_db(&root)?;
+            fs::create_dir_all(&to)?;
+            if targets.len() == 1 && db::package_exists(&conn, &targets[0])? {
+                transfer::export_package(&conn, &root, &targets[0], &to)?;
+                println!("Exported package '{}' to {}", targets[0], to.display());
+            } else {
+                transfer::export_hashes(&conn, &root, &targets, &to)?;
+                println!("Exported {} blob(s) to {}", targets.len(), to.display());
+            }
+            Ok(())
+        }
+        Commands::Import { from } => {
+            let conn = db::open_db(&root)?;
+            let result = transfer::import_from(&conn, &root, &from)?;
+            println!("Imported {} blob(s) from {}", result.imported_blobs, from.display());
+            Ok(())
+        }
     }
 }
