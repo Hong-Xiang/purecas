@@ -101,6 +101,8 @@ enum Commands {
         /// Optional note describing the relation
         note: Option<String>,
     },
+    /// Run as a Git LFS custom transfer agent (stdin/stdout protocol)
+    LfsAgent,
 }
 
 #[derive(Subcommand)]
@@ -298,5 +300,6 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Commands::LfsAgent => lfs::run_agent(&root),
     }
 }
