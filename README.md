@@ -207,7 +207,7 @@ pcas path a3f2c1deadbeef...    # get filesystem path to use in scripts
 ```bash
 nix develop            # enter dev shell
 cargo build            # build
-cargo test             # run all tests (19 unit + 12 integration)
+cargo test             # run all tests (43 unit + 19 integration)
 cargo clippy           # lint
 cargo fmt              # format
 nix build .#pcas       # nix build
@@ -219,5 +219,46 @@ nix build .#pcas       # nix build
 - **Read-only blobs (0o444)** -- prevents accidental modification of stored content.
 - **SQLite metadata** -- lightweight, embedded, no external dependencies. Tracks filenames and package membership.
 - **Filesystem is the source of truth for content** -- the DB tracks metadata. `pcas path` and `pcas cat` work without a DB, only needing the blob files.
-- **No built-in transport** -- export/import produces/consumes directories. Use rsync, scp, or any tool for transfer.
+- **No built-in transport** -- export/import produces/consumes directories. Use rsync, scp, or any tool for transfer. Git LFS integration is available for version-controlled workflows.
 - **No garbage collection (yet)** -- planned for a future release.
+
+## Git LFS Integration
+
+`pcas` can act as a [Git LFS custom transfer agent](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md), allowing Git LFS to store large files in your purecas CAS instead of a remote server.
+
+### Setup
+
+Add to your repo's `.git/config` (or global `~/.gitconfig`):
+
+```gitconfig
+[lfs "customtransfer.pcas"]
+    path = pcas
+    args = "lfs-agent"
+[lfs]
+    standalonetransferagent = pcas
+```
+
+If your CAS root isn't the default (`~/data/blob`), pass it via args:
+
+```gitconfig
+[lfs "customtransfer.pcas"]
+    path = pcas
+    args = "--root /path/to/cas lfs-agent"
+```
+
+Or set the `CAS_ROOT` environment variable.
+
+### How it works
+
+When you `git push` or `git pull`, Git LFS spawns `pcas lfs-agent` and communicates via a JSON protocol over stdin/stdout:
+
+- **Upload (`git push`):** Stores the blob in the CAS (`sha256/<prefix>/<hash>`), verifies the hash matches the LFS OID, and registers it in the metadata DB. Progress is reported during the transfer.
+- **Download (`git pull`):** Returns the CAS path for the blob, which Git LFS reads directly.
+
+### Manual testing
+
+```bash
+echo '{"event":"init","operation":"upload","remote":"origin","concurrent":false}' \
+  | pcas lfs-agent
+# → {"event":"init"}
+```

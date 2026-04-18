@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{db, store};
 
@@ -10,6 +10,7 @@ use crate::{db, store};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event")]
 #[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
 pub enum IncomingEvent {
     Init {
         operation: Operation,
