@@ -579,3 +579,123 @@ fn test_rel() {
         .stdout(predicate::str::contains("->"))
         .stdout(predicate::str::contains("derived from"));
 }
+
+#[test]
+fn test_lfs_agent_init() {
+    let root = cas_root();
+    let input = "{\"event\":\"init\",\"operation\":\"upload\",\"remote\":\"origin\",\"concurrent\":true,\"concurrentbatches\":1}\n\
+                 {\"event\":\"terminate\"}\n";
+    let output = pcas()
+        .args(["--root", root.path().to_str().unwrap(), "lfs-agent"])
+        .write_stdin(input)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"event\":\"init\""));
+}
+
+#[test]
+fn test_lfs_agent_upload_roundtrip() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("upload.bin");
+    fs::write(&file, b"lfs upload content").unwrap();
+    let file_size = fs::metadata(&file).unwrap().len();
+
+    // Compute hash via pcas add into a throwaway root
+    let hash_root = cas_root();
+    let add_output = pcas()
+        .args([
+            "--root",
+            hash_root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_stdout = String::from_utf8(add_output.stdout).unwrap();
+    let hash = add_stdout.split_whitespace().next().unwrap().to_string();
+
+    // Fresh CAS root for LFS upload
+    let lfs_root = cas_root();
+    let input = format!(
+        "{{\"event\":\"init\",\"operation\":\"upload\",\"remote\":\"origin\",\"concurrent\":true,\"concurrentbatches\":1}}\n\
+         {{\"event\":\"upload\",\"oid\":\"{hash}\",\"size\":{file_size},\"path\":\"{path}\"}}\n\
+         {{\"event\":\"terminate\"}}\n",
+        hash = hash,
+        file_size = file_size,
+        path = file.to_str().unwrap().replace('\\', "\\\\"),
+    );
+    let output = pcas()
+        .args(["--root", lfs_root.path().to_str().unwrap(), "lfs-agent"])
+        .write_stdin(input)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("\"event\":\"complete\""),
+        "expected complete event in: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"error\""),
+        "unexpected error in: {stdout}"
+    );
+
+    // Verify blob exists in the fresh CAS
+    pcas()
+        .args(["--root", lfs_root.path().to_str().unwrap(), "path", &hash])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[exists]"));
+}
+
+#[test]
+fn test_lfs_agent_download_roundtrip() {
+    let root = cas_root();
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("download.bin");
+    fs::write(&file, b"lfs download content").unwrap();
+    let file_size = fs::metadata(&file).unwrap().len();
+
+    // Add file to CAS
+    let add_output = pcas()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "add",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_stdout = String::from_utf8(add_output.stdout).unwrap();
+    let hash = add_stdout.split_whitespace().next().unwrap().to_string();
+
+    // Download via LFS agent from same root
+    let input = format!(
+        "{{\"event\":\"init\",\"operation\":\"download\",\"remote\":\"origin\",\"concurrent\":true,\"concurrentbatches\":1}}\n\
+         {{\"event\":\"download\",\"oid\":\"{hash}\",\"size\":{file_size}}}\n\
+         {{\"event\":\"terminate\"}}\n",
+        hash = hash,
+        file_size = file_size,
+    );
+    let output = pcas()
+        .args(["--root", root.path().to_str().unwrap(), "lfs-agent"])
+        .write_stdin(input)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("\"event\":\"complete\""),
+        "expected complete event in: {stdout}"
+    );
+    assert!(
+        stdout.contains(&hash),
+        "expected hash {hash} in: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"error\""),
+        "unexpected error in: {stdout}"
+    );
+}
