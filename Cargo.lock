@@ -1174,6 +1174,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "predicates",
+ "purecas",
+ "tempfile",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1260,9 +1272,6 @@ name = "purecas"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "assert_cmd",
- "clap",
- "predicates",
  "reqwest",
  "rusqlite",
  "serde",

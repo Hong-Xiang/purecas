@@ -2,11 +2,7 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
-mod db;
-mod fetch;
-mod lfs;
-mod store;
-mod transfer;
+use purecas::{db, fetch, lfs, store, transfer};
 
 #[derive(Parser)]
 #[command(
