@@ -1,8 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::fs;
 use std::path::PathBuf;
-
-use purecas::{db, fetch, lfs, store, transfer};
 
 #[derive(Parser)]
 #[command(
@@ -20,8 +17,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add files to the CAS
-    Add {
+    /// Add files from local paths to the CAS
+    AddPath {
         /// Files to add
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -32,13 +29,13 @@ enum Commands {
         #[arg(long = "meta")]
         meta: Option<String>,
     },
-    /// Fetch a URL, verify hash, and store in CAS
-    Fetch {
+    /// Download a URL and store in CAS
+    AddUrl {
         /// URL to download
         url: String,
-        /// Expected SHA-256 hash
+        /// Expected SHA-256 hash (if provided, verifies after download)
         #[arg(long)]
-        sha256: String,
+        sha256: Option<String>,
         /// Extract zip archive and store each file individually
         #[arg(long)]
         unzip: bool,
@@ -48,21 +45,15 @@ enum Commands {
         /// SHA-256 hash
         hash: String,
     },
-    /// Output blob contents to stdout
-    Cat {
-        /// SHA-256 hash
-        hash: String,
-    },
     /// Package operations
     Pkg {
         #[command(subcommand)]
         command: PkgCommands,
     },
-    /// Export blobs and metadata to a directory
+    /// Export a package to a directory
     Export {
-        /// Package name or blob hashes to export
-        #[arg(required = true)]
-        targets: Vec<String>,
+        /// Package name
+        package: String,
         /// Destination directory
         #[arg(long)]
         to: PathBuf,
@@ -150,117 +141,114 @@ fn resolve_root(cli_root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let root = resolve_root(cli.root)?;
+    let store = purecas::Store::open(&root)?;
 
     match cli.command {
-        Commands::Add { files, tags, meta } => {
-            let conn = db::open_db(&root)?;
+        Commands::AddPath { files, tags, meta } => {
             for file in &files {
-                let hash = store::store_blob(&root, file)?;
+                let blob = store.add_path(file)?;
                 let name = file
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                db::insert_blob(&conn, &hash)?;
-                if !name.is_empty() {
-                    db::insert_blob_name(&conn, &hash, &name)?;
-                }
-                for tag in &tags {
-                    db::add_tag(&conn, &hash, tag)?;
+                let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+                if !tag_refs.is_empty() {
+                    blob.add_tags(&tag_refs)?;
                 }
                 if let Some(ref m) = meta {
-                    db::set_metadata(&conn, &hash, m)?;
+                    blob.set_metadata(m)?;
                 }
-                println!("{} {}", hash, name);
+                println!("{} {}", blob.hash(), name);
             }
             Ok(())
         }
-        Commands::Fetch { url, sha256, unzip } => {
-            let conn = db::open_db(&root)?;
-            if unzip {
-                let results = fetch::fetch_unzip_and_store(&url, &sha256, &root)?;
-                for (hash, name) in &results {
-                    db::insert_blob(&conn, hash)?;
-                    db::insert_blob_name(&conn, hash, name)?;
-                    println!("{} {}", hash, name);
-                }
-            } else {
-                let hash = fetch::fetch_and_store(&url, &sha256, &root)?;
-                db::insert_blob(&conn, &hash)?;
-                if let Some(name) = url.rsplit('/').next() {
-                    if !name.is_empty() {
-                        db::insert_blob_name(&conn, &hash, name)?;
+        Commands::AddUrl { url, sha256, unzip } => {
+            match (sha256, unzip) {
+                (Some(hash), true) => {
+                    let blobs = store.add_verified_url_unzip(&url, &hash)?;
+                    for blob in &blobs {
+                        let names = blob.names().unwrap_or_default();
+                        let name = names.first().map(|s| s.as_str()).unwrap_or("");
+                        println!("{} {}", blob.hash(), name);
                     }
                 }
-                println!("{}", hash);
+                (Some(hash), false) => {
+                    let blob = store.add_verified_url(&url, &hash)?;
+                    println!("{}", blob.hash());
+                }
+                (None, true) => {
+                    let blobs = store.add_url_unzip(&url)?;
+                    for blob in &blobs {
+                        let names = blob.names().unwrap_or_default();
+                        let name = names.first().map(|s| s.as_str()).unwrap_or("");
+                        println!("{} {}", blob.hash(), name);
+                    }
+                }
+                (None, false) => {
+                    let blob = store.add_url(&url)?;
+                    println!("{}", blob.hash());
+                }
             }
             Ok(())
         }
         Commands::Path { hash } => {
-            let p = store::blob_path(&root, &hash);
-            let status = if p.exists() { "[exists]" } else { "[missing]" };
-            println!("{} {}", p.display(), status);
+            let blob = store.blob(&hash);
+            println!("{}", blob.path().display());
             Ok(())
         }
-        Commands::Cat { hash } => store::cat_blob(&root, &hash),
-        Commands::Pkg { command } => {
-            let conn = db::open_db(&root)?;
-            match command {
-                PkgCommands::Create { name, description } => {
-                    db::create_package(&conn, &name, description.as_deref())?;
-                    println!("Created package: {}", name);
-                    Ok(())
-                }
-                PkgCommands::Add { name, hashes, path } => {
-                    if path.is_some() && hashes.len() > 1 {
-                        anyhow::bail!("--path can only be used with a single hash");
-                    }
-                    for hash in &hashes {
-                        db::add_blob_to_package(&conn, &name, hash, path.as_deref())?;
-                    }
-                    Ok(())
-                }
-                PkgCommands::List => {
-                    let pkgs = db::list_packages(&conn)?;
-                    for (name, count) in pkgs {
-                        println!("{}\t{} blobs", name, count);
-                    }
-                    Ok(())
-                }
-                PkgCommands::Show { name } => {
-                    let blobs = db::show_package(&conn, &name)?;
-                    for (hash, path, names) in blobs {
-                        let path_str = path.as_deref().unwrap_or("-");
-                        let names_str = if names.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", names.join(", "))
-                        };
-                        println!("{}\t{}{}", hash, path_str, names_str);
-                    }
-                    Ok(())
-                }
-                PkgCommands::Rm { name } => {
-                    db::remove_package(&conn, &name)?;
-                    println!("Removed package: {}", name);
-                    Ok(())
-                }
+        Commands::Pkg { command } => match command {
+            PkgCommands::Create { name, description } => {
+                store.create_package(&name, description.as_deref())?;
+                println!("Created package: {}", name);
+                Ok(())
             }
-        }
-        Commands::Export { targets, to } => {
-            let conn = db::open_db(&root)?;
-            fs::create_dir_all(&to)?;
-            if targets.len() == 1 && db::package_exists(&conn, &targets[0])? {
-                transfer::export_package(&conn, &root, &targets[0], &to)?;
-                println!("Exported package '{}' to {}", targets[0], to.display());
-            } else {
-                transfer::export_hashes(&conn, &root, &targets, &to)?;
-                println!("Exported {} blob(s) to {}", targets.len(), to.display());
+            PkgCommands::Add { name, hashes, path } => {
+                if path.is_some() && hashes.len() > 1 {
+                    anyhow::bail!("--path can only be used with a single hash");
+                }
+                let pkg = store.package(&name);
+                for hash in &hashes {
+                    let blob = store.blob(hash);
+                    pkg.add_blob(&blob, path.as_deref())?;
+                }
+                Ok(())
             }
+            PkgCommands::List => {
+                let pkgs = store.list_packages()?;
+                for pkg in &pkgs {
+                    let blob_count = pkg.blobs().map(|b| b.len()).unwrap_or(0);
+                    println!("{}\t{} blobs", pkg.name(), blob_count);
+                }
+                Ok(())
+            }
+            PkgCommands::Show { name } => {
+                let pkg = store.package(&name);
+                let blobs = pkg.blobs()?;
+                for info in &blobs {
+                    let path_str = info.path.as_deref().unwrap_or("-");
+                    let names_str = if info.names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", info.names.join(", "))
+                    };
+                    println!("{}\t{}{}", info.hash, path_str, names_str);
+                }
+                Ok(())
+            }
+            PkgCommands::Rm { name } => {
+                store.package(&name).remove()?;
+                println!("Removed package: {}", name);
+                Ok(())
+            }
+        },
+        Commands::Export { package, to } => {
+            std::fs::create_dir_all(&to)?;
+            store.package(&package).export(&to)?;
+            println!("Exported package '{}' to {}", package, to.display());
             Ok(())
         }
         Commands::Import { from } => {
-            let conn = db::open_db(&root)?;
-            let result = transfer::import_from(&conn, &root, &from)?;
+            let result = store.import(&from)?;
             println!(
                 "Imported {} blob(s) from {}",
                 result.imported_blobs,
@@ -269,17 +257,16 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Tag { id, tags } => {
-            let conn = db::open_db(&root)?;
-            for tag in &tags {
-                db::add_tag(&conn, &id, tag)?;
-            }
-            let all_tags = db::get_tags(&conn, &id)?;
+            let blob = store.blob(&id);
+            let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+            blob.add_tags(&tag_refs)?;
+            let all_tags = blob.tags()?;
             println!("{}: {}", id, all_tags.join("; "));
             Ok(())
         }
         Commands::Meta { id, value } => {
-            let conn = db::open_db(&root)?;
-            db::set_metadata(&conn, &id, &value)?;
+            let blob = store.blob(&id);
+            blob.set_metadata(&value)?;
             println!("{}: {}", id, value);
             Ok(())
         }
@@ -288,14 +275,15 @@ fn main() -> anyhow::Result<()> {
             target,
             note,
         } => {
-            let conn = db::open_db(&root)?;
-            db::add_relation(&conn, &source, &target, note.as_deref())?;
+            let src = store.blob(&source);
+            let tgt = store.blob(&target);
+            src.add_relation(&tgt, note.as_deref())?;
             match &note {
                 Some(n) => println!("{} -> {} ({})", source, target, n),
                 None => println!("{} -> {}", source, target),
             }
             Ok(())
         }
-        Commands::LfsAgent => lfs::run_agent(&root),
+        Commands::LfsAgent => purecas::lfs::run_agent(&root),
     }
 }
