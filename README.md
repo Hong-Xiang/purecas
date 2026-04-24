@@ -50,7 +50,7 @@ The CAS root directory is resolved in this order:
 
 ```bash
 # Add one or more files to the store
-pcas add model.pth dataset.zip
+pcas add-path model.pth dataset.zip
 
 # Output: <sha256 hash> <filename> per file
 # a3f2c1dead...  model.pth
@@ -63,23 +63,26 @@ Adding is idempotent -- re-adding the same file content is a no-op (but a new fi
 
 ```bash
 # Download, verify SHA-256, and store
-pcas fetch https://example.com/weights.pth --sha256 a3f2c1dead...
+pcas add-url https://example.com/weights.pth --sha256 a3f2c1dead...
+
+# Download without hash verification (hash computed after download)
+pcas add-url https://example.com/weights.pth
 
 # Download a zip, verify, extract, and store each file individually
-pcas fetch https://example.com/dataset.zip --sha256 b7e4d9beef... --unzip
+pcas add-url https://example.com/dataset.zip --sha256 b7e4d9beef... --unzip
 ```
 
-The `--sha256` flag is required. If the downloaded file's hash doesn't match, the command fails and nothing is stored.
+If `--sha256` is provided and the downloaded file's hash doesn't match, the command fails and nothing is stored.
 
 ### Looking up files
 
 ```bash
-# Print the filesystem path for a hash (and whether it exists)
+# Print the filesystem path for a hash
 pcas path a3f2c1dead...
-# /home/user/data/blob/sha256/a3/a3f2c1dead...  [exists]
+# /home/user/data/blob/sha256/a3/a3f2c1dead...
 
-# Output blob contents to stdout
-pcas cat a3f2c1dead... > restored_file.pth
+# Read blob contents via shell pipe
+cat $(pcas path a3f2c1dead...) > restored_file.pth
 ```
 
 ### Packages
@@ -118,8 +121,8 @@ Export copies blobs to a directory (preserving the `sha256/` layout) along with 
 # Export a package
 pcas export sbd-rai --to /mnt/drive/sbd-export/
 
-# Export specific hashes (no package context)
-pcas export a3f2c1dead... b7e4d9beef... --to /tmp/blobs/
+# Copy individual blobs with shell
+cp $(pcas path a3f2c1dead...) /tmp/blobs/
 
 # Transfer using any tool you like
 rsync -a /mnt/drive/sbd-export/ remote:/tmp/sbd-import/
@@ -136,11 +139,11 @@ Import merges with existing data: packages gain new blobs, blob names are extend
 
 ```bash
 # Per-command override
-pcas --root /data/models add large_model.pth
+pcas --root /data/models add-path large_model.pth
 
 # Or set the environment variable
 export CAS_ROOT=/data/models
-pcas add large_model.pth
+pcas add-path large_model.pth
 ```
 
 ## Nix Integration
@@ -168,9 +171,9 @@ purecas is designed to work with Nix flakes. The key idea: Nix handles reproduci
           set -euo pipefail
 
           # Hashes are pre-calculated (like nix fixed-output derivations)
-          ${pcas}/bin/pcas fetch "https://example.com/sbd-videos.zip" \
+          ${pcas}/bin/pcas add-url "https://example.com/sbd-videos.zip" \
             --sha256 a3f2c1deadbeef... --unzip
-          ${pcas}/bin/pcas fetch "https://example.com/sbd-annotations.zip" \
+          ${pcas}/bin/pcas add-url "https://example.com/sbd-annotations.zip" \
             --sha256 b7e4d9beefcafe... --unzip
 
           # Organize into a package
@@ -207,10 +210,62 @@ pcas path a3f2c1deadbeef...    # get filesystem path to use in scripts
 ```bash
 nix develop            # enter dev shell
 cargo build            # build
-cargo test             # run all tests (43 unit + 19 integration)
+cargo test             # run all tests (54 unit + 19 integration)
 cargo clippy           # lint
 cargo fmt              # format
 nix build .#pcas       # nix build
+```
+
+## Library Usage (Rust)
+
+purecas is also a library crate. Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+purecas = { path = "purecas" }
+```
+
+```rust
+use purecas::Store;
+
+let store = Store::open("/path/to/cas")?;
+
+// Add a file
+let blob = store.add_path("data/file.bin")?;
+println!("Stored: {}", blob.hash());
+
+// Metadata
+blob.add_tags(&["train", "v2"])?;
+blob.set_metadata("epoch=10")?;
+
+// Packages
+let pkg = store.create_package("my-dataset", Some("training data"))?;
+pkg.add_blob(&blob, Some("images/001.png"))?;
+pkg.export("/tmp/export")?;
+```
+
+## Python Usage
+
+Install with maturin:
+
+```bash
+cd purecas-python
+maturin develop
+```
+
+```python
+import purecas
+
+store = purecas.Store.open("/path/to/cas")
+blob = store.add_path("/data/file.bin")
+print(blob.hash, blob.path)
+
+blob.add_tags(["train", "v2"])
+blob.set_metadata("epoch=10")
+
+pkg = store.create_package("my-dataset")
+pkg.add_blob(blob, path="images/001.png")
+pkg.export("/tmp/export")
 ```
 
 ## Design Decisions
