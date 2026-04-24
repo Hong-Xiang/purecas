@@ -47,6 +47,7 @@
           rust-analyzer
           pkg-config
           openssl
+          maturin
         ];
       };
     };
