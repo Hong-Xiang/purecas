@@ -98,37 +98,6 @@ pub fn export_package(conn: &Connection, root: &Path, package: &str, to: &Path) 
     Ok(())
 }
 
-/// Export a list of hashes (no package context) to a target directory.
-pub fn export_hashes(conn: &Connection, root: &Path, hashes: &[String], to: &Path) -> Result<()> {
-    for hash in hashes {
-        copy_blob_to(root, hash, to)?;
-    }
-
-    let blob_names = db::get_all_blob_names(conn, hashes)?;
-    let hash_list: Vec<String> = hashes.to_vec();
-    let tags = db::get_all_tags(conn, &hash_list)?;
-    let meta = db::get_all_metadata(conn, &hash_list)?;
-    let relations = db::get_all_relations(conn, &hash_list)?
-        .into_iter()
-        .map(|(s, t, n)| ExportRelation {
-            source: s,
-            target: t,
-            note: n,
-        })
-        .collect();
-
-    let metadata = ExportMetadata {
-        packages: vec![],
-        blob_names,
-        tags,
-        metadata: meta,
-        relations,
-    };
-
-    write_export_metadata(to, &metadata)?;
-    Ok(())
-}
-
 fn copy_blob_to(root: &Path, hash: &str, to: &Path) -> Result<()> {
     let src = store::blob_path(root, hash);
     let dest = to.join("sha256").join(&hash[..2]).join(hash);
@@ -263,28 +232,6 @@ mod tests {
         assert_eq!(meta.packages[0].blobs.len(), 1);
         assert_eq!(meta.packages[0].blobs[0].hash, hash);
         assert_eq!(meta.blob_names[&hash], vec!["test.bin"]);
-    }
-
-    #[test]
-    fn test_export_hashes() {
-        let (root, conn, hash) = setup_cas_with_blob(b"just a blob");
-
-        let export_dir = TempDir::new().unwrap();
-        export_hashes(&conn, root.path(), &[hash.clone()], export_dir.path()).unwrap();
-
-        let exported_blob = export_dir
-            .path()
-            .join("sha256")
-            .join(&hash[..2])
-            .join(&hash);
-        assert!(exported_blob.exists());
-
-        let meta: ExportMetadata = serde_json::from_str(
-            &fs::read_to_string(export_dir.path().join(EXPORT_FILENAME)).unwrap(),
-        )
-        .unwrap();
-        assert!(meta.packages.is_empty());
-        assert!(meta.blob_names.contains_key(&hash));
     }
 
     #[test]
