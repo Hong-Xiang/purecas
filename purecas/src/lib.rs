@@ -62,6 +62,12 @@ impl Store {
     }
 }
 
+impl<'a> std::fmt::Debug for Blob<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Blob").field("hash", &self.hash).finish()
+    }
+}
+
 impl<'a> Blob<'a> {
     /// The SHA-256 hash of this blob.
     pub fn hash(&self) -> &str {
@@ -129,6 +135,33 @@ impl Store {
             store: self,
             name: name.to_string(),
         })
+    }
+
+    /// Add a file from a local path to the store. Returns the stored Blob.
+    pub fn add_path(&self, path: &Path) -> Result<Blob<'_>> {
+        let hash = store::store_blob(&self.root, path)?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        db::insert_blob(&self.conn, &hash)?;
+        if !name.is_empty() {
+            db::insert_blob_name(&self.conn, &hash, &name)?;
+        }
+        Ok(self.blob(&hash))
+    }
+
+    /// Add a file from a local path, verifying it matches the expected hash.
+    pub fn add_verified_path(&self, path: &Path, expected_hash: &str) -> Result<Blob<'_>> {
+        let actual_hash = store::hash_file(path)?;
+        if actual_hash != expected_hash {
+            anyhow::bail!(
+                "hash mismatch: expected {}, got {}",
+                expected_hash,
+                actual_hash
+            );
+        }
+        self.add_path(path)
     }
 
     /// Get a Package handle by name. Cheap — no db check.
@@ -261,6 +294,42 @@ mod tests {
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].target, "tgt1");
         assert_eq!(rels[0].note, Some("derived-from".to_string()));
+    }
+
+    #[test]
+    fn test_add_path() {
+        let dir = TempDir::new().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let blob = s.add_path(&file).unwrap();
+        assert_eq!(blob.hash(), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert!(blob.path().exists());
+    }
+
+    #[test]
+    fn test_add_verified_path_ok() {
+        let dir = TempDir::new().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let blob = s.add_verified_path(
+            &file,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        ).unwrap();
+        assert_eq!(blob.hash(), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+    }
+
+    #[test]
+    fn test_add_verified_path_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let result = s.add_verified_path(&file, "0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("hash mismatch"));
     }
 
     #[test]
