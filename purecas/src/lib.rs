@@ -151,6 +151,92 @@ impl Store {
         Ok(self.blob(&hash))
     }
 
+    /// Download a URL and store in CAS. The hash is computed from the downloaded content.
+    pub fn add_url(&self, url: &str) -> Result<Blob<'_>> {
+        let temp = tempfile::tempdir()?;
+        let downloaded = fetch::download_to_temp(url, temp.path())?;
+        let hash = store::store_blob(&self.root, &downloaded)?;
+        db::insert_blob(&self.conn, &hash)?;
+        if let Some(name) = url.rsplit('/').next() {
+            if !name.is_empty() {
+                db::insert_blob_name(&self.conn, &hash, name)?;
+            }
+        }
+        Ok(self.blob(&hash))
+    }
+
+    /// Download a URL, verify SHA-256, and store in CAS.
+    pub fn add_verified_url(&self, url: &str, expected_hash: &str) -> Result<Blob<'_>> {
+        let temp = tempfile::tempdir()?;
+        let downloaded = fetch::download_to_temp(url, temp.path())?;
+        fetch::verify_hash(&downloaded, expected_hash)?;
+        let hash = store::store_blob(&self.root, &downloaded)?;
+        db::insert_blob(&self.conn, &hash)?;
+        if let Some(name) = url.rsplit('/').next() {
+            if !name.is_empty() {
+                db::insert_blob_name(&self.conn, &hash, name)?;
+            }
+        }
+        Ok(self.blob(&hash))
+    }
+
+    /// Download a URL, unzip, and store each file in CAS.
+    pub fn add_url_unzip(&self, url: &str) -> Result<Vec<Blob<'_>>> {
+        let temp = tempfile::tempdir()?;
+        let downloaded = fetch::download_to_temp(url, temp.path())?;
+        self.unzip_and_store(&downloaded)
+    }
+
+    /// Download a URL, verify SHA-256, unzip, and store each file in CAS.
+    pub fn add_verified_url_unzip(
+        &self,
+        url: &str,
+        expected_hash: &str,
+    ) -> Result<Vec<Blob<'_>>> {
+        let temp = tempfile::tempdir()?;
+        let downloaded = fetch::download_to_temp(url, temp.path())?;
+        fetch::verify_hash(&downloaded, expected_hash)?;
+        self.unzip_and_store(&downloaded)
+    }
+
+    fn unzip_and_store(&self, archive_path: &Path) -> Result<Vec<Blob<'_>>> {
+        let temp = tempfile::tempdir()?;
+        let extract_dir = temp.path().join("extracted");
+        std::fs::create_dir_all(&extract_dir)?;
+
+        let file = std::fs::File::open(archive_path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+
+        let mut blobs = Vec::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry
+                .enclosed_name()
+                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let out_path = extract_dir.join(&name);
+            let mut out_file = std::fs::File::create(&out_path)?;
+            std::io::copy(&mut entry, &mut out_file)?;
+
+            let hash = store::store_blob(&self.root, &out_path)?;
+            db::insert_blob(&self.conn, &hash)?;
+            db::insert_blob_name(&self.conn, &hash, &name)?;
+            blobs.push(self.blob(&hash));
+        }
+        Ok(blobs)
+    }
+
+    /// Import blobs and metadata from an export directory.
+    pub fn import(&self, from: &Path) -> Result<ImportResult> {
+        transfer::import_from(&self.conn, &self.root, from)
+    }
+
     /// Add a file from a local path, verifying it matches the expected hash.
     pub fn add_verified_path(&self, path: &Path, expected_hash: &str) -> Result<Blob<'_>> {
         let actual_hash = store::hash_file(path)?;
