@@ -188,11 +188,7 @@ impl Store {
     }
 
     /// Download a URL, verify SHA-256, unzip, and store each file in CAS.
-    pub fn add_verified_url_unzip(
-        &self,
-        url: &str,
-        expected_hash: &str,
-    ) -> Result<Vec<Blob<'_>>> {
+    pub fn add_verified_url_unzip(&self, url: &str, expected_hash: &str) -> Result<Vec<Blob<'_>>> {
         let temp = tempfile::tempdir()?;
         let downloaded = fetch::download_to_temp(url, temp.path())?;
         fetch::verify_hash(&downloaded, expected_hash)?;
@@ -263,10 +259,7 @@ impl Store {
         let raw = db::list_packages(&self.conn)?;
         Ok(raw
             .into_iter()
-            .map(|(name, _count)| Package {
-                store: self,
-                name,
-            })
+            .map(|(name, _count)| Package { store: self, name })
             .collect())
     }
 }
@@ -332,7 +325,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = Store::open(dir.path()).unwrap();
         let b = s.blob("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let expected = dir.path().join("sha256").join("ab").join("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let expected = dir
+            .path()
+            .join("sha256")
+            .join("ab")
+            .join("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
         assert_eq!(b.path(), expected);
     }
 
@@ -389,7 +386,10 @@ mod tests {
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
         let blob = s.add_path(&file).unwrap();
-        assert_eq!(blob.hash(), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            blob.hash(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
         assert!(blob.path().exists());
     }
 
@@ -399,11 +399,16 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
-        let blob = s.add_verified_path(
-            &file,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-        ).unwrap();
-        assert_eq!(blob.hash(), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        let blob = s
+            .add_verified_path(
+                &file,
+                "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+            )
+            .unwrap();
+        assert_eq!(
+            blob.hash(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]
@@ -412,7 +417,10 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
-        let result = s.add_verified_path(&file, "0000000000000000000000000000000000000000000000000000000000000000");
+        let result = s.add_verified_path(
+            &file,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("hash mismatch"));

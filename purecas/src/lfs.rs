@@ -106,10 +106,7 @@ fn handle_upload<W: Write>(writer: &mut W, root: &Path, oid: &str, path: &str) -
                         path: None,
                         error: Some(TransferError {
                             code: 2,
-                            message: format!(
-                                "hash mismatch: expected {}, got {}",
-                                oid, hash
-                            ),
+                            message: format!("hash mismatch: expected {}, got {}", oid, hash),
                         }),
                     },
                 )?;
@@ -203,9 +200,7 @@ pub fn run_agent_io<R: BufRead, W: Write>(
             IncomingEvent::Init { .. } => {
                 send(output, &OutgoingEvent::Init { error: None })?;
             }
-            IncomingEvent::Upload {
-                oid, path, ..
-            } => {
+            IncomingEvent::Upload { oid, path, .. } => {
                 handle_upload(output, root, &oid, &path)?;
             }
             IncomingEvent::Download { oid, size, .. } => {
@@ -416,10 +411,13 @@ mod tests {
     #[test]
     fn test_agent_init_and_terminate() {
         let root = TempDir::new().unwrap();
-        let output = run_protocol(root.path(), &[
-            r#"{"event":"init","operation":"upload"}"#,
-            r#"{"event":"terminate"}"#,
-        ]);
+        let output = run_protocol(
+            root.path(),
+            &[
+                r#"{"event":"init","operation":"upload"}"#,
+                r#"{"event":"terminate"}"#,
+            ],
+        );
         let events = parse_output_events(&output);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event"], "init");
@@ -437,15 +435,18 @@ mod tests {
         // Compute the expected hash
         let expected_hash = store::hash_file(&src_file).unwrap();
 
-        let output = run_protocol(root.path(), &[
-            r#"{"event":"init","operation":"upload"}"#,
-            &format!(
-                r#"{{"event":"upload","oid":"{}","size":11,"path":"{}"}}"#,
-                expected_hash,
-                src_file.to_string_lossy()
-            ),
-            r#"{"event":"terminate"}"#,
-        ]);
+        let output = run_protocol(
+            root.path(),
+            &[
+                r#"{"event":"init","operation":"upload"}"#,
+                &format!(
+                    r#"{{"event":"upload","oid":"{}","size":11,"path":"{}"}}"#,
+                    expected_hash,
+                    src_file.to_string_lossy()
+                ),
+                r#"{"event":"terminate"}"#,
+            ],
+        );
         let events = parse_output_events(&output);
 
         // First event: init
@@ -470,15 +471,18 @@ mod tests {
 
         let bad_oid = "0000000000000000000000000000000000000000000000000000000000000000";
 
-        let output = run_protocol(root.path(), &[
-            r#"{"event":"init","operation":"upload"}"#,
-            &format!(
-                r#"{{"event":"upload","oid":"{}","size":11,"path":"{}"}}"#,
-                bad_oid,
-                src_file.to_string_lossy()
-            ),
-            r#"{"event":"terminate"}"#,
-        ]);
+        let output = run_protocol(
+            root.path(),
+            &[
+                r#"{"event":"init","operation":"upload"}"#,
+                &format!(
+                    r#"{{"event":"upload","oid":"{}","size":11,"path":"{}"}}"#,
+                    bad_oid,
+                    src_file.to_string_lossy()
+                ),
+                r#"{"event":"terminate"}"#,
+            ],
+        );
         let events = parse_output_events(&output);
         let complete = events.iter().find(|e| e["event"] == "complete").unwrap();
         let err = complete.get("error").expect("expected error in complete");
@@ -497,14 +501,14 @@ mod tests {
         std::fs::write(&src_file, b"hello world").unwrap();
         let hash = store::store_blob(root.path(), &src_file).unwrap();
 
-        let output = run_protocol(root.path(), &[
-            r#"{"event":"init","operation":"download"}"#,
-            &format!(
-                r#"{{"event":"download","oid":"{}","size":11}}"#,
-                hash
-            ),
-            r#"{"event":"terminate"}"#,
-        ]);
+        let output = run_protocol(
+            root.path(),
+            &[
+                r#"{"event":"init","operation":"download"}"#,
+                &format!(r#"{{"event":"download","oid":"{}","size":11}}"#, hash),
+                r#"{"event":"terminate"}"#,
+            ],
+        );
         let events = parse_output_events(&output);
         let complete = events.iter().find(|e| e["event"] == "complete").unwrap();
         assert_eq!(complete["oid"], hash);
@@ -518,14 +522,17 @@ mod tests {
         let root = TempDir::new().unwrap();
         let missing_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        let output = run_protocol(root.path(), &[
-            r#"{"event":"init","operation":"download"}"#,
-            &format!(
-                r#"{{"event":"download","oid":"{}","size":100}}"#,
-                missing_oid
-            ),
-            r#"{"event":"terminate"}"#,
-        ]);
+        let output = run_protocol(
+            root.path(),
+            &[
+                r#"{"event":"init","operation":"download"}"#,
+                &format!(
+                    r#"{{"event":"download","oid":"{}","size":100}}"#,
+                    missing_oid
+                ),
+                r#"{"event":"terminate"}"#,
+            ],
+        );
         let events = parse_output_events(&output);
         let complete = events.iter().find(|e| e["event"] == "complete").unwrap();
         let err = complete.get("error").expect("expected error");
@@ -545,15 +552,18 @@ mod tests {
         std::fs::write(&src_file, &data).unwrap();
         let expected_hash = store::hash_file(&src_file).unwrap();
 
-        let output = run_protocol(root.path(), &[
-            r#"{"event":"init","operation":"upload"}"#,
-            &format!(
-                r#"{{"event":"upload","oid":"{}","size":32768,"path":"{}"}}"#,
-                expected_hash,
-                src_file.to_string_lossy()
-            ),
-            r#"{"event":"terminate"}"#,
-        ]);
+        let output = run_protocol(
+            root.path(),
+            &[
+                r#"{"event":"init","operation":"upload"}"#,
+                &format!(
+                    r#"{{"event":"upload","oid":"{}","size":32768,"path":"{}"}}"#,
+                    expected_hash,
+                    src_file.to_string_lossy()
+                ),
+                r#"{"event":"terminate"}"#,
+            ],
+        );
         let events = parse_output_events(&output);
         let progress_events: Vec<_> = events.iter().filter(|e| e["event"] == "progress").collect();
         assert!(

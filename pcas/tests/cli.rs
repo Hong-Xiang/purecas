@@ -74,7 +74,10 @@ fn test_path_missing_blob() {
     let root = cas_root();
     let path_output = pcas()
         .args(["--root", root.path().to_str().unwrap()])
-        .args(["path", "0000000000000000000000000000000000000000000000000000000000000000"])
+        .args([
+            "path",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ])
         .assert()
         .success();
     let stdout = String::from_utf8(path_output.get_output().stdout.clone()).unwrap();
@@ -277,9 +280,7 @@ fn test_tag_blob() {
         .args(["tag", hash, "dataset", "production"])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("dataset").and(predicate::str::contains("production")),
-        );
+        .stdout(predicate::str::contains("dataset").and(predicate::str::contains("production")));
 }
 
 #[test]
@@ -315,9 +316,12 @@ fn test_add_path_with_tag_and_meta() {
         .args([
             "add-path",
             file.to_str().unwrap(),
-            "--tag", "model",
-            "--tag", "v1",
-            "--meta", "ResNet50 pretrained",
+            "--tag",
+            "model",
+            "--tag",
+            "v1",
+            "--meta",
+            "ResNet50 pretrained",
         ])
         .assert()
         .success();
@@ -369,15 +373,14 @@ fn test_rel() {
         .args(["rel", &hash1, &hash2, "derived from"])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("->").and(predicate::str::contains("derived from")),
-        );
+        .stdout(predicate::str::contains("->").and(predicate::str::contains("derived from")));
 }
 
 #[test]
 fn test_lfs_agent_init() {
     let root = cas_root();
-    let init_msg = r#"{"event":"init","operation":"upload","concurrent":true,"concurrenttransfers":3}"#;
+    let init_msg =
+        r#"{"event":"init","operation":"upload","concurrent":true,"concurrenttransfers":3}"#;
     let terminate_msg = r#"{"event":"terminate"}"#;
     let input = format!("{}\n{}\n", init_msg, terminate_msg);
 
@@ -399,7 +402,8 @@ fn test_lfs_agent_upload_roundtrip() {
     fs::write(&upload_file, b"lfs content").unwrap();
     let expected_hash = "057cab134d8758e5de0f03d63b3ab7e5d5582d89d57a501df241155ac0bfe741";
 
-    let init_msg = r#"{"event":"init","operation":"upload","concurrent":true,"concurrenttransfers":1}"#;
+    let init_msg =
+        r#"{"event":"init","operation":"upload","concurrent":true,"concurrenttransfers":1}"#;
     let upload_msg = format!(
         r#"{{"event":"upload","oid":"{}","size":11,"path":"{}","action":{{"href":"","header":{{}}}}}}"#,
         expected_hash,
@@ -419,7 +423,11 @@ fn test_lfs_agent_upload_roundtrip() {
     assert!(stdout.contains(r#""event":"complete"#));
     assert!(!stdout.contains(r#""error"#));
 
-    let blob_path = root.path().join("sha256").join(&expected_hash[..2]).join(expected_hash);
+    let blob_path = root
+        .path()
+        .join("sha256")
+        .join(&expected_hash[..2])
+        .join(expected_hash);
     assert!(blob_path.exists());
 }
 
@@ -429,7 +437,8 @@ fn test_lfs_agent_upload_hash_mismatch() {
     let upload_file = root.path().join("lfs_bad.bin");
     fs::write(&upload_file, b"lfs content").unwrap();
 
-    let init_msg = r#"{"event":"init","operation":"upload","concurrent":true,"concurrenttransfers":1}"#;
+    let init_msg =
+        r#"{"event":"init","operation":"upload","concurrent":true,"concurrenttransfers":1}"#;
     let upload_msg = format!(
         r#"{{"event":"upload","oid":"0000000000000000000000000000000000000000000000000000000000000000","size":11,"path":"{}","action":{{"href":"","header":{{}}}}}}"#,
         upload_file.to_str().unwrap()
@@ -466,7 +475,8 @@ fn test_lfs_agent_download_roundtrip() {
         .unwrap()
         .to_string();
 
-    let init_msg = r#"{"event":"init","operation":"download","concurrent":true,"concurrenttransfers":1}"#;
+    let init_msg =
+        r#"{"event":"init","operation":"download","concurrent":true,"concurrenttransfers":1}"#;
     let download_msg = format!(
         r#"{{"event":"download","oid":"{}","size":11,"action":{{"href":"","header":{{}}}}}}"#,
         hash
@@ -489,7 +499,8 @@ fn test_lfs_agent_download_roundtrip() {
 #[test]
 fn test_lfs_agent_download_missing() {
     let root = cas_root();
-    let init_msg = r#"{"event":"init","operation":"download","concurrent":true,"concurrenttransfers":1}"#;
+    let init_msg =
+        r#"{"event":"init","operation":"download","concurrent":true,"concurrenttransfers":1}"#;
     let download_msg = r#"{"event":"download","oid":"0000000000000000000000000000000000000000000000000000000000000000","size":11,"action":{"href":"","header":{}}}"#;
     let terminate_msg = r#"{"event":"terminate"}"#;
     let input = format!("{}\n{}\n{}\n", init_msg, download_msg, terminate_msg);
