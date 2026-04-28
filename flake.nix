@@ -27,6 +27,8 @@
         strictDeps = true;
         nativeBuildInputs = with pkgs; [ pkg-config ];
         buildInputs = with pkgs; [ openssl ];
+        # Only build purecas + pcas; purecas-python needs Python and is built via maturin
+        cargoExtraArgs = "--workspace --exclude purecas-python";
       };
 
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
