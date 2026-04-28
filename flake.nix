@@ -24,6 +24,8 @@
 
       commonArgs = {
         inherit src;
+        pname = "pcas";
+        version = "0.1.0";
         strictDeps = true;
         nativeBuildInputs = with pkgs; [ pkg-config ];
         buildInputs = with pkgs; [ openssl ];
