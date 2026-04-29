@@ -24,9 +24,13 @@
 
       commonArgs = {
         inherit src;
+        pname = "pcas";
+        version = "0.1.0";
         strictDeps = true;
         nativeBuildInputs = with pkgs; [ pkg-config ];
         buildInputs = with pkgs; [ openssl ];
+        # Only build purecas + pcas; purecas-python needs Python and is built via maturin
+        cargoExtraArgs = "--workspace --exclude purecas-python";
       };
 
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -47,6 +51,7 @@
           rust-analyzer
           pkg-config
           openssl
+          maturin
         ];
       };
     };

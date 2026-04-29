@@ -1,23 +1,4 @@
-[package]
-name = "purecas"
-version = "0.1.0"
-edition = "2021"
-
-[[bin]]
-name = "pcas"
-path = "src/main.rs"
-
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-sha2 = "0.10"
-rusqlite = { version = "0.31", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["blocking"] }
-tempfile = "3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-zip = "2"
-anyhow = "1"
-
-[dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
+[workspace]
+members = ["purecas", "pcas", "purecas-python"]
+default-members = ["purecas", "pcas"]
+resolver = "2"

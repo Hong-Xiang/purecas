@@ -1,0 +1,13 @@
+[package]
+name = "purecas-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "purecas"
+crate-type = ["cdylib"]
+
+[dependencies]
+purecas_core = { package = "purecas", path = "../purecas" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+anyhow = "1"
