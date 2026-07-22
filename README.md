@@ -74,12 +74,36 @@ pcas add-url https://example.com/dataset.zip --sha256 b7e4d9beef... --unzip
 
 If `--sha256` is provided and the downloaded file's hash doesn't match, the command fails and nothing is stored.
 
+### Filesystem object index (in progress)
+
+purecas is transitioning to a filesystem-first design (see the design
+issue for the full plan). The new `pcas index` command discovers regular
+files under `PCAS_ROOT` and creates one hard-linked object entry per
+distinct SHA-256 digest under `.pcas/sha256/<first2>/`, without touching
+`purecas.db`:
+
+```bash
+# Index every visible file under the CAS root
+pcas index
+
+# Index only files matching a pattern (basename, or root-relative if it
+# contains a '/')
+pcas index '*.mp4'
+pcas index 'datasets/train/*.bin'
+```
+
+`pcas path <hash>` (below) now resolves exclusively against these
+`.pcas` object entries: it requires the content to have been indexed with
+`pcas index` first, fails if the digest is unknown, and never opens
+`purecas.db`. It is no longer related to `pcas add-path`'s `sha256/`
+layout.
+
 ### Looking up files
 
 ```bash
-# Print the filesystem path for a hash
+# Print the filesystem path for a hash indexed with `pcas index`
 pcas path a3f2c1dead...
-# /home/user/data/blob/sha256/a3/a3f2c1dead...
+# /home/user/data/blob/.pcas/sha256/a3/a3f2c1dead...--20260722T130016.139Z
 
 # Read blob contents via shell pipe
 cat $(pcas path a3f2c1dead...) > restored_file.pth
