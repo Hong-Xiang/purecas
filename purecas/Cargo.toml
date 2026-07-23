@@ -23,6 +23,7 @@ mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 askama_escape = "0.16.0"
 http = "1.4.2"
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 filetime = "0.2"

@@ -3,24 +3,23 @@
 //! without opening a network socket (see `router()`); `listen()` is the
 //! only function that actually binds a socket.
 
+use crate::serve::digest;
 use crate::serve::listing;
 use crate::serve::path::{self, PathError, VisiblePath};
-use crate::serve::precondition::{self, Outcome as PreconditionOutcome};
 use crate::serve::representation::Representation;
 use crate::serve::resolve::{self, Resolved, Root};
+use crate::serve::respond;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use headers::{CacheControl, HeaderMapExt, LastModified};
-use http::header::{ACCEPT_RANGES, ALLOW, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use headers::{CacheControl, HeaderMapExt};
+use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
-use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
-use tokio_util::io::ReaderStream;
 
 /// Shared, immutable server state.
 pub struct AppState {
@@ -45,7 +44,28 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return method_not_allowed();
     }
 
+    // The digest route is intercepted from the exact raw request path,
+    // before any percent-decoding or visible-path parsing: every other
+    // top-level `/pcas` form falls through to ordinary dispatch below,
+    // which already rejects the reserved `pcas` segment with `404`.
     let raw_path = req.uri().path();
+    if let Some(raw_digest) = digest::match_route(raw_path) {
+        return match digest::dispatch(
+            state.root.canonical_root(),
+            &method,
+            req.headers(),
+            raw_digest,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                log_internal_error(&err);
+                internal_error()
+            }
+        };
+    }
+
     let parsed = match path::parse(raw_path) {
         Ok(parsed) => parsed,
         Err(PathError::MalformedPercentEncoding | PathError::Nul) => return bad_request(),
@@ -88,13 +108,7 @@ async fn dispatch(
                 return Ok(not_found());
             }
             let requested_name = parsed.segments.last().map(Vec::as_slice).unwrap_or(b"");
-            Ok(respond_file(
-                method,
-                headers,
-                requested_name,
-                opened.file,
-                opened.meta,
-            ))
+            Ok(respond_file(method, headers, requested_name, opened.file, opened.meta).await)
         }
         Resolved::Directory { canonical_path } => {
             respond_directory(
@@ -110,67 +124,15 @@ async fn dispatch(
     }
 }
 
-fn respond_file(
+async fn respond_file(
     method: &Method,
     headers: &HeaderMap,
     requested_name: &[u8],
     file: tokio::fs::File,
     meta: std::fs::Metadata,
 ) -> Response {
-    let repr = Representation::from_metadata(&meta);
-
-    match precondition::evaluate(headers, method, &repr.etag, repr.last_modified) {
-        Err(_) => return bad_request(),
-        Ok(PreconditionOutcome::PreconditionFailed) => {
-            return representation_only_response(StatusCode::PRECONDITION_FAILED, &repr)
-        }
-        Ok(PreconditionOutcome::NotModified) => {
-            return representation_only_response(StatusCode::NOT_MODIFIED, &repr)
-        }
-        Ok(PreconditionOutcome::Proceed) => {}
-    }
-
-    let mime =
-        mime_guess::from_path(Path::new(OsStr::from_bytes(requested_name))).first_or_octet_stream();
-
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&repr.len.to_string())
-            .expect("decimal length is a valid header value"),
-    );
-    response_headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_str(mime.as_ref())
-            .expect("mime_guess never returns invalid header syntax"),
-    );
-    response_headers.typed_insert(LastModified::from(repr.last_modified));
-    response_headers.typed_insert(repr.etag.clone());
-    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    response_headers.typed_insert(CacheControl::new().with_no_cache());
-
-    let body = if *method == Method::HEAD {
-        Body::empty()
-    } else {
-        Body::from_stream(ReaderStream::new(file))
-    };
-
-    let mut response = Response::new(body);
-    *response.headers_mut() = response_headers;
-    response
-}
-
-/// Build a `304`/`412` response carrying only the representation
-/// validators (`ETag`, `Last-Modified`, `Cache-Control`) and an empty body.
-fn representation_only_response(status: StatusCode, repr: &Representation) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.typed_insert(repr.etag.clone());
-    headers.typed_insert(LastModified::from(repr.last_modified));
-    headers.typed_insert(CacheControl::new().with_no_cache());
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
+    let repr = Representation::for_hierarchy(&meta, requested_name);
+    respond::respond(method, headers, &repr, file).await
 }
 
 async fn respond_directory(
@@ -188,13 +150,7 @@ async fn respond_directory(
     if let Resolved::File(opened) =
         resolve::resolve_child(&state.root, canonical_dir, b"index.html").await?
     {
-        return Ok(respond_file(
-            method,
-            headers,
-            b"index.html",
-            opened.file,
-            opened.meta,
-        ));
+        return Ok(respond_file(method, headers, b"index.html", opened.file, opened.meta).await);
     }
 
     let mut entries = Vec::new();
@@ -330,6 +286,43 @@ mod tests {
 
     fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
         response.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Write one file and index it, returning the resulting digest as a
+    /// lowercase hex string.
+    fn index_one(root: &Path, name: &str, content: &[u8]) -> String {
+        std::fs::write(root.join(name), content).unwrap();
+        let report = crate::index::index_root(root, None, false).unwrap();
+        report.created[0].digest.as_str().to_string()
+    }
+
+    fn boundary_from_content_type(content_type: &str) -> String {
+        content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("multipart Content-Type carries a boundary")
+            .to_string()
+    }
+
+    /// Rebuild the exact expected `multipart/byteranges` body from its
+    /// parts, mirroring the wire format the server renders.
+    fn expected_multipart_body(
+        boundary: &str,
+        mime: &str,
+        full_len: usize,
+        parts: &[(u64, u64, &[u8])],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (start, end, data) in parts {
+            out.extend_from_slice(
+                format!("--{boundary}\r\nContent-Type: {mime}\r\nContent-Range: bytes {start}-{end}/{full_len}\r\n\r\n")
+                    .as_bytes(),
+            );
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        out
     }
 
     #[tokio::test]
@@ -756,5 +749,666 @@ mod tests {
             StatusCode::OK
         );
         assert!(!dir.path().join("purecas.db").exists());
+    }
+
+    // --- digest route: identity, headers, normalization, errors --------
+
+    #[tokio::test]
+    async fn hierarchy_and_digest_serve_identical_full_bytes() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "data.bin", b"identical bytes everywhere");
+
+        let hierarchy = get(make_router(dir.path()), "/data.bin").await;
+        let via_digest = get(make_router(dir.path()), &format!("/pcas/{digest}")).await;
+        assert_eq!(hierarchy.status(), StatusCode::OK);
+        assert_eq!(via_digest.status(), StatusCode::OK);
+        let hierarchy_body = body_bytes(hierarchy).await;
+        let digest_body = body_bytes(via_digest).await;
+        assert_eq!(hierarchy_body, b"identical bytes everywhere");
+        assert_eq!(hierarchy_body, digest_body);
+    }
+
+    #[tokio::test]
+    async fn digest_route_headers_are_exact() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "movie.mp4", b"video bytes");
+
+        let response = get(make_router(dir.path()), &format!("/pcas/{digest}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, "etag"),
+            Some(format!("\"{digest}\"").as_str())
+        );
+        assert_eq!(
+            header(&response, "cache-control"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(header(&response, "content-type"), Some("video/mp4"));
+        assert_eq!(header(&response, "accept-ranges"), Some("bytes"));
+        assert!(header(&response, "last-modified").is_some());
+    }
+
+    #[tokio::test]
+    async fn digest_route_falls_back_to_octet_stream_without_suffix() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "no-extension", b"opaque bytes");
+        let response = get(make_router(dir.path()), &format!("/pcas/{digest}")).await;
+        assert_eq!(
+            header(&response, "content-type"),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_route_normalizes_uppercase_hex() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "data.bin", b"case insensitive");
+        let response = get(
+            make_router(dir.path()),
+            &format!("/pcas/{}", digest.to_uppercase()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"case insensitive");
+    }
+
+    #[tokio::test]
+    async fn digest_route_unknown_digest_is_404() {
+        let dir = TempDir::new().unwrap();
+        let unknown = "0".repeat(64);
+        let response = get(make_router(dir.path()), &format!("/pcas/{unknown}")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn digest_route_malformed_hex_is_404() {
+        let dir = TempDir::new().unwrap();
+        let bad = format!("z{}", "a".repeat(63));
+        let response = get(make_router(dir.path()), &format!("/pcas/{bad}")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn digest_route_bare_trailing_slash_and_extra_segment_are_404() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "data.bin", b"content");
+        for uri in [
+            "/pcas".to_string(),
+            format!("/pcas/{digest}/"),
+            format!("/pcas/{digest}/extra"),
+        ] {
+            let response = get(make_router(dir.path()), &uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn digest_route_ambiguous_shard_is_500() {
+        let dir = TempDir::new().unwrap();
+        let digest = "a".repeat(64);
+        let shard = dir.path().join(".pcas/sha256").join(&digest[..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join(format!("{digest}--20260722T130016Z")), b"x").unwrap();
+        std::fs::write(shard.join(format!("{digest}--20260722T140000Z")), b"x").unwrap();
+
+        let response = get(make_router(dir.path()), &format!("/pcas/{digest}")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(!body.contains(dir.path().to_str().unwrap()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn digest_route_malformed_shard_entry_is_500() {
+        let dir = TempDir::new().unwrap();
+        let digest = "b".repeat(64);
+        let shard = dir.path().join(".pcas/sha256").join(&digest[..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("not-a-valid-object-name"), b"x").unwrap();
+
+        let response = get(make_router(dir.path()), &format!("/pcas/{digest}")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn digest_route_never_creates_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "data.bin", b"content");
+        assert_eq!(
+            get(make_router(dir.path()), &format!("/pcas/{digest}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(!dir.path().join("purecas.db").exists());
+    }
+
+    // --- byte ranges: forms, clamping, malformed vs. unsatisfiable ------
+
+    #[tokio::test]
+    async fn range_closed_form_returns_exact_bytes() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=2-5")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 2-5/10"));
+        assert_eq!(header(&response, "content-length"), Some("4"));
+        assert_eq!(body_bytes(response).await, b"2345");
+    }
+
+    #[tokio::test]
+    async fn range_open_ended_form_runs_to_end() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=8-")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 8-9/10"));
+        assert_eq!(body_bytes(response).await, b"89");
+    }
+
+    #[tokio::test]
+    async fn range_suffix_form_returns_last_bytes() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=-3")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 7-9/10"));
+        assert_eq!(body_bytes(response).await, b"789");
+    }
+
+    #[tokio::test]
+    async fn range_oversized_suffix_is_the_entire_representation() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=-1000")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 0-9/10"));
+        assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn range_closed_end_is_clamped_to_length() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=5-9999")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 5-9/10"));
+        assert_eq!(body_bytes(response).await, b"56789");
+    }
+
+    #[tokio::test]
+    async fn range_mixed_satisfiable_and_unsatisfiable_keeps_satisfiable() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=1000-2000,0-3")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 0-3/10"));
+        assert_eq!(body_bytes(response).await, b"0123");
+    }
+
+    #[tokio::test]
+    async fn range_reversed_is_400() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=9-2")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn range_malformed_grammar_is_400() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=a-b")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn range_overflowing_integer_is_400() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=99999999999999999999-")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn range_unsupported_unit_is_ignored_and_returns_full_200() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "items=0-2")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn range_against_empty_file_is_416() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("empty.bin"), b"").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/empty.bin",
+            &[("range", "bytes=0-0")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&response, "content-range"), Some("bytes */0"));
+    }
+
+    #[tokio::test]
+    async fn range_wholly_unsatisfiable_is_416_with_content_range() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=1000-2000")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&response, "content-range"), Some("bytes */10"));
+        assert!(header(&response, "etag").is_some());
+    }
+
+    #[tokio::test]
+    async fn range_excessive_raw_specs_is_416() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), vec![b'x'; 1000]).unwrap();
+        let spec = (0..65)
+            .map(|i| format!("{}-{}", i * 2, i * 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", &format!("bytes={spec}"))],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn range_excessive_coalesced_ranges_is_416() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), vec![b'x'; 1000]).unwrap();
+        // 17 disjoint single-byte ranges: none adjacent, so none coalesce.
+        let spec = (0..17)
+            .map(|i| format!("{}-{}", i * 2, i * 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", &format!("bytes={spec}"))],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn duplicate_range_header_lines_combine_in_field_order() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/f.bin")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .append("range", HeaderValue::from_static("bytes=0-1"));
+        req.headers_mut()
+            .append("range", HeaderValue::from_static("bytes=8-9"));
+        let response = make_router(dir.path()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(header(&response, "content-type")
+            .unwrap()
+            .starts_with("multipart/byteranges"));
+        let content_type = header(&response, "content-type").unwrap().to_string();
+        let boundary = boundary_from_content_type(&content_type);
+        let expected = expected_multipart_body(
+            &boundary,
+            "application/octet-stream",
+            10,
+            &[(0, 1, b"01"), (8, 9, b"89")],
+        );
+        assert_eq!(body_bytes(response).await, expected);
+    }
+
+    #[tokio::test]
+    async fn overlapping_and_adjacent_ranges_are_coalesced() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=0-3,2-5,6-7")],
+        )
+        .await;
+        // 0-3 and 2-5 overlap; 6-7 is adjacent to the merged 0-5: the
+        // whole set coalesces into one 0-9 range.
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&response, "content-range"), Some("bytes 0-7/10"));
+        assert_eq!(body_bytes(response).await, b"01234567");
+    }
+
+    // --- multipart: exact bytes, exact Content-Length, sequential I/O ---
+
+    #[tokio::test]
+    async fn multipart_body_and_content_length_are_exact_across_digit_widths() {
+        let dir = TempDir::new().unwrap();
+        let content: Vec<u8> = (0..1000).map(|i| b'a' + (i % 26) as u8).collect();
+        std::fs::write(dir.path().join("data.txt"), &content).unwrap();
+
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/data.txt",
+            &[("range", "bytes=0-4,50-59,900-999")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let content_type = header(&response, "content-type").unwrap().to_string();
+        assert!(content_type.starts_with("multipart/byteranges; boundary="));
+        let boundary = boundary_from_content_type(&content_type);
+        let declared_length: usize = header(&response, "content-length")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let body = body_bytes(response).await;
+        let expected = expected_multipart_body(
+            &boundary,
+            "text/plain",
+            1000,
+            &[
+                (0, 4, &content[0..5]),
+                (50, 59, &content[50..60]),
+                (900, 999, &content[900..1000]),
+            ],
+        );
+        assert_eq!(declared_length, body.len());
+        assert_eq!(body, expected);
+    }
+
+    // --- If-Range: strong match, mismatch, weak-never, date, malformed --
+
+    #[tokio::test]
+    async fn if_range_strong_digest_etag_match_honors_range() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "data.bin", b"0123456789");
+        let uri = format!("/pcas/{digest}");
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            &uri,
+            &[
+                ("range", "bytes=0-3"),
+                ("if-range", &format!("\"{digest}\"")),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(response).await, b"0123");
+    }
+
+    #[tokio::test]
+    async fn if_range_strong_digest_etag_mismatch_ignores_range() {
+        let dir = TempDir::new().unwrap();
+        let digest = index_one(dir.path(), "data.bin", b"0123456789");
+        let uri = format!("/pcas/{digest}");
+        let other = "f".repeat(64);
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            &uri,
+            &[
+                ("range", "bytes=0-3"),
+                ("if-range", &format!("\"{other}\"")),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn if_range_weak_hierarchy_etag_never_satisfies_tag_form() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let current_etag = header(&get(make_router(dir.path()), "/f.bin").await, "etag")
+            .unwrap()
+            .to_string();
+        assert!(current_etag.starts_with("W/\""));
+
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=0-3"), ("if-range", &current_etag)],
+        )
+        .await;
+        // A weak validator can never satisfy If-Range, even when it is
+        // (textually) the resource's own current ETag: the range is
+        // ignored and the full representation is served.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn if_range_date_not_modified_since_honors_range() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let last_modified = header(
+            &get(make_router(dir.path()), "/f.bin").await,
+            "last-modified",
+        )
+        .unwrap()
+        .to_string();
+
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=0-3"), ("if-range", &last_modified)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(response).await, b"0123");
+    }
+
+    #[tokio::test]
+    async fn if_range_date_modified_since_ignores_range() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[
+                ("range", "bytes=0-3"),
+                ("if-range", "Mon, 01 Jan 1990 00:00:00 GMT"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn if_range_malformed_is_400() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=0-3"), ("if-range", "not-a-valid-if-range")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn normal_preconditions_win_over_range_processing() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let etag = header(&get(make_router(dir.path()), "/f.bin").await, "etag")
+            .unwrap()
+            .to_string();
+
+        let response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("if-none-match", &etag), ("range", "bytes=0-3")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_bytes(response).await.is_empty());
+    }
+
+    // --- HEAD mirrors full/single/multipart GET status and headers -----
+
+    #[tokio::test]
+    async fn head_mirrors_full_response_headers_with_empty_body() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let get_response = get(make_router(dir.path()), "/f.bin").await;
+        let head_response = request(make_router(dir.path()), Method::HEAD, "/f.bin", &[]).await;
+        assert_eq!(head_response.status(), get_response.status());
+        for name in ["content-length", "content-type", "etag", "accept-ranges"] {
+            assert_eq!(header(&get_response, name), header(&head_response, name));
+        }
+        assert!(body_bytes(head_response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_mirrors_single_range_response_headers_with_empty_body() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let get_response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=2-5")],
+        )
+        .await;
+        let head_response = request(
+            make_router(dir.path()),
+            Method::HEAD,
+            "/f.bin",
+            &[("range", "bytes=2-5")],
+        )
+        .await;
+        assert_eq!(head_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(head_response.status(), get_response.status());
+        for name in ["content-length", "content-range", "content-type"] {
+            assert_eq!(header(&get_response, name), header(&head_response, name));
+        }
+        assert!(body_bytes(head_response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_mirrors_multipart_response_headers_with_empty_body() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let get_response = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/f.bin",
+            &[("range", "bytes=0-1,8-9")],
+        )
+        .await;
+        let head_response = request(
+            make_router(dir.path()),
+            Method::HEAD,
+            "/f.bin",
+            &[("range", "bytes=0-1,8-9")],
+        )
+        .await;
+        assert_eq!(head_response.status(), StatusCode::PARTIAL_CONTENT);
+        for name in ["content-length", "content-type"] {
+            assert_eq!(header(&get_response, name), header(&head_response, name));
+        }
+        assert!(body_bytes(head_response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_mirrors_416_response_headers_with_empty_body() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"0123456789").unwrap();
+        let head_response = request(
+            make_router(dir.path()),
+            Method::HEAD,
+            "/f.bin",
+            &[("range", "bytes=1000-2000")],
+        )
+        .await;
+        assert_eq!(head_response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&head_response, "content-range"), Some("bytes */10"));
+        assert!(body_bytes(head_response).await.is_empty());
     }
 }
