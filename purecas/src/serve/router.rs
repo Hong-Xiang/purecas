@@ -97,7 +97,15 @@ async fn dispatch(
             ))
         }
         Resolved::Directory { canonical_path } => {
-            respond_directory(state, method, uri, &canonical_path, parsed.trailing_slash).await
+            respond_directory(
+                state,
+                method,
+                uri,
+                headers,
+                &canonical_path,
+                parsed.trailing_slash,
+            )
+            .await
         }
     }
 }
@@ -169,6 +177,7 @@ async fn respond_directory(
     state: &AppState,
     method: &Method,
     uri: &Uri,
+    headers: &HeaderMap,
     canonical_dir: &Path,
     trailing_slash: bool,
 ) -> Result<Response> {
@@ -179,10 +188,9 @@ async fn respond_directory(
     if let Resolved::File(opened) =
         resolve::resolve_child(&state.root, canonical_dir, b"index.html").await?
     {
-        let empty_headers = HeaderMap::new();
         return Ok(respond_file(
             method,
-            &empty_headers,
+            headers,
             b"index.html",
             opened.file,
             opened.meta,
@@ -505,8 +513,17 @@ mod tests {
         let response = get(make_router(dir.path()), "/sub/").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(header(&response, "content-type"), Some("text/html"));
-        assert!(header(&response, "etag").is_some());
+        let etag = header(&response, "etag").unwrap().to_string();
         assert_eq!(body_bytes(response).await, b"<h1>hi</h1>");
+
+        let conditional = request(
+            make_router(dir.path()),
+            Method::GET,
+            "/sub/",
+            &[("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
