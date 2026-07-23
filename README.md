@@ -213,19 +213,43 @@ pcas --root /data/models serve --bind 0.0.0.0:9000
 ```bash
 curl http://127.0.0.1:8000/datasets/train/001.bin
 curl http://127.0.0.1:8000/datasets/train/   # directory listing
+curl http://127.0.0.1:8000/pcas/<64-hex-sha256>  # immutable digest access
 ```
 
 `serve` is dispatched before `purecas.db` is ever opened, so it never
 creates or reads the legacy SQLite database, and it never exposes it if it
-already exists at the root. `.pcas` (the internal object store) and the
-top-level `/pcas` path (reserved for the future digest route) are never
-served; nested directories literally named `pcas` remain visible. `GET`
-and `HEAD` support full representation metadata (`Content-Length`,
-`Content-Type`, `Last-Modified`, `Accept-Ranges`, a weak `ETag`) and RFC
-9110 conditional requests (`If-Match`, `If-Unmodified-Since`,
-`If-None-Match`, `If-Modified-Since`). Byte-range requests, the
-`/pcas/<hash>` digest route, and a strong immutable `ETag` are deferred to
-a follow-up slice.
+already exists at the root. `.pcas` (the internal object store) is never
+served; nested directories literally named `pcas` remain visible.
+
+Every visible file and every resolved digest is opened exactly once, and
+representation metadata and body bytes both come from that same
+descriptor. `GET`/`HEAD` on either route return full representation
+metadata (`Content-Length`, `Content-Type`, `Last-Modified`,
+`Accept-Ranges`) and support RFC 9110 conditional requests (`If-Match`,
+`If-Unmodified-Since`, `If-None-Match`, `If-Modified-Since`) and RFC 9110
+byte-range requests (`Range`, `If-Range`), including single and
+`multipart/byteranges` responses.
+
+The two routes differ only in identity, cache policy, and MIME hints:
+
+- **Visible hierarchy** (`/datasets/train/001.bin`): a weak `ETag` derived
+  from the descriptor's device/inode/size/mtime, `Cache-Control: no-cache`
+  (content at a path can change), and MIME guessed from the visible file
+  name.
+- **Digest route** (`/pcas/<64-hex-sha256>`, exact match only — a bare
+  `/pcas`, a trailing slash, or an extra segment all `404`): accepts
+  either hex case and normalizes it, a strong `ETag` of exactly
+  `"<lowercase-digest>"`, `Cache-Control: public, max-age=31536000,
+  immutable` (content is immutable by contract; in-place mutation is
+  store damage, repaired by `pcas index`), and MIME guessed from the
+  packed object's suffix (falling back to `application/octet-stream`).
+  An unknown or malformed digest is `404`; a corrupt or ambiguous packed
+  index entry is `500` without leaking host paths.
+
+Because the digest `ETag` is strong, `If-Range` there can be satisfied by
+an entity-tag; the hierarchy route's `ETag` is always weak, so an
+entity-tag `If-Range` there always falls back to the full representation
+(`HTTP-date`-based `If-Range` works on both routes).
 
 ## Nix Integration
 
@@ -356,7 +380,7 @@ pkg.export("/tmp/export")
 - **SQLite metadata** -- lightweight, embedded, no external dependencies. Tracks filenames and package membership.
 - **Filesystem is the source of truth for content** -- the DB tracks metadata. `pcas path` and `pcas cat` work without a DB, only needing the blob files.
 - **No built-in transport** -- export/import produces/consumes directories. Use rsync, scp, or any tool for transfer. Git LFS integration is available for version-controlled workflows.
-- **`pcas serve` on axum/Tokio** -- the visible-hierarchy HTTP server (see above) uses current stable `axum`/Tokio, already present transitively through `reqwest`; every file is opened exactly once and representation metadata/body bytes both come from that same descriptor, so `tower-http`'s path-only `ServeFile`/`ServeDir` (which would reopen a path after deriving metadata) are deliberately not used. The async runtime is entered only for this command.
+- **`pcas serve` on axum/Tokio** -- the visible-hierarchy and digest HTTP routes (see above) use current stable `axum`/Tokio, already present transitively through `reqwest`; every file or resolved digest is opened exactly once and representation metadata/body bytes both come from that same descriptor, so `tower-http`'s path-only `ServeFile`/`ServeDir` (which would reopen a path after deriving metadata) are deliberately not used. The async runtime is entered only for this command. Byte-range parsing is a small hand-written grammar rather than `headers::Range::satisfiable_ranges` or `http-range-header`: both were evaluated and found to reject or mishandle required cases (clamping, coalescing overlapping ranges, a suffix range longer than the representation, distinguishing malformed syntax from an unsatisfiable set).
 - **No garbage collection (yet)** -- planned for a future release.
 
 ## Git LFS Integration

@@ -33,6 +33,10 @@ pub mod representation;
 pub mod resolve;
 pub mod router;
 
+mod digest;
+mod range;
+mod respond;
+
 use anyhow::{Context, Result};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -117,6 +121,58 @@ mod tests {
         assert_eq!(response.status(), 200);
         let body = response.bytes().await.unwrap();
         assert_eq!(&body[..], b"hello from disk");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server shut down within timeout")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_ranges_and_digest_over_a_real_socket() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"0123456789").unwrap();
+        let report = crate::index::index_root(dir.path(), None, false).unwrap();
+        let digest = report.created[0].digest.as_str().to_string();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (local_addr, server) =
+            bind_and_serve(dir.path(), "127.0.0.1:0".parse().unwrap(), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+
+        let server_task = tokio::spawn(server);
+
+        let client = reqwest::Client::new();
+
+        let ranged = client
+            .get(format!("http://{local_addr}/data.bin"))
+            .header("range", "bytes=2-5")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ranged.status(), 206);
+        assert_eq!(
+            ranged.headers().get("content-range").unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(&ranged.bytes().await.unwrap()[..], b"2345");
+
+        let via_digest = client
+            .get(format!("http://{local_addr}/pcas/{digest}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(via_digest.status(), 200);
+        assert_eq!(
+            via_digest.headers().get("etag").unwrap(),
+            format!("\"{digest}\"").as_str()
+        );
+        assert_eq!(&via_digest.bytes().await.unwrap()[..], b"0123456789");
 
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), server_task)

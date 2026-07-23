@@ -39,14 +39,14 @@ mod prune;
 mod reconcile;
 mod scan;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use discover::{discover_files, Pattern};
 use lock::IndexLock;
 use scan::scan_object_index;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use types::{ObjectFileName, RootRelativePath, Sha256Digest};
+use types::{FileTypeSuffix, ObjectFileName, RootRelativePath, Sha256Digest};
 
 pub use reconcile::{FailureKind, IndexedFile, PathFailure};
 
@@ -58,47 +58,115 @@ fn shard_dir(root: &Path, digest: &Sha256Digest) -> PathBuf {
     sha256_dir(root).join(digest.shard())
 }
 
+/// Why resolving a digest against the packed object index failed.
+///
+/// Every variant carries the human-readable `anyhow::Error` that `pcas
+/// path` prints for context; the HTTP digest route instead matches the
+/// variant to choose `404` (`NotFound`) or `500` (`CorruptIndex`, `Io`)
+/// without ever surfacing the wrapped message (which may contain host
+/// paths) to the client.
+#[derive(Debug)]
+pub enum DigestResolutionError {
+    /// The digest string does not parse, or no object entry exists for
+    /// it. These are deliberately not distinguished further: neither is
+    /// observable by an HTTP client beyond "not found".
+    NotFound(anyhow::Error),
+    /// The packed index state itself is malformed, unreadable, or
+    /// ambiguous (more than one entry for the same digest): store
+    /// corruption, not a normal miss.
+    CorruptIndex(anyhow::Error),
+    /// An unexpected I/O failure unrelated to the index's logical state
+    /// (e.g. a transient `read_dir` failure other than "not found").
+    Io(anyhow::Error),
+}
+
+impl DigestResolutionError {
+    /// Recover the wrapped contextual error, e.g. for `pcas path` to print
+    /// or propagate via `?`.
+    pub fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::NotFound(e) | Self::CorruptIndex(e) | Self::Io(e) => e,
+        }
+    }
+}
+
+impl fmt::Display for DigestResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(e) | Self::CorruptIndex(e) | Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for DigestResolutionError {}
+
+/// One matching packed object entry found in a digest's shard directory.
+struct ShardMatch {
+    path: PathBuf,
+    suffix: Option<FileTypeSuffix>,
+}
+
 /// The outcome of resolving a digest against a single shard directory.
 enum ShardLookup {
     NotFound,
-    Found(PathBuf),
+    Found(ShardMatch),
     Ambiguous(Vec<PathBuf>),
 }
 
 /// Scan only `digest`'s shard directory and find the one object entry
 /// whose fixed digest prefix matches. Malformed entries in that shard are
-/// reported as store corruption. Used by `pcas path`, which must resolve
-/// a single digest without loading the complete object index.
-fn scan_shard_for_digest(root: &Path, digest: &Sha256Digest) -> Result<ShardLookup> {
+/// reported as store corruption. Used by `pcas path` and the HTTP digest
+/// route, which must resolve a single digest without loading the complete
+/// object index.
+fn scan_shard_for_digest(
+    root: &Path,
+    digest: &Sha256Digest,
+) -> Result<ShardLookup, DigestResolutionError> {
     let dir = shard_dir(root, digest);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ShardLookup::NotFound),
-        Err(e) => return Err(e).with_context(|| format!("reading shard {}", dir.display())),
+        Err(e) => {
+            return Err(DigestResolutionError::Io(
+                anyhow::Error::new(e).context(format!("reading shard {}", dir.display())),
+            ))
+        }
     };
 
-    let mut matches = Vec::new();
+    let mut matches: Vec<ShardMatch> = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| format!("reading shard {}", dir.display()))?;
-        let file_name = entry.file_name();
-        let file_name = file_name.to_str().with_context(|| {
-            format!(
-                "object entry name is not valid UTF-8: {}",
-                entry.path().display()
+        let entry = entry.map_err(|e| {
+            DigestResolutionError::Io(
+                anyhow::Error::new(e).context(format!("reading shard {}", dir.display())),
             )
         })?;
-        let parsed = ObjectFileName::parse(file_name).with_context(|| {
-            format!("malformed object entry {} in {}", file_name, dir.display())
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str().ok_or_else(|| {
+            DigestResolutionError::CorruptIndex(anyhow!(
+                "object entry name is not valid UTF-8: {}",
+                entry.path().display()
+            ))
+        })?;
+        let parsed = ObjectFileName::parse(file_name).map_err(|e| {
+            DigestResolutionError::CorruptIndex(e.context(format!(
+                "malformed object entry {file_name} in {}",
+                dir.display()
+            )))
         })?;
         if parsed.digest() == digest {
-            matches.push(entry.path());
+            matches.push(ShardMatch {
+                path: entry.path(),
+                suffix: parsed.suffix().cloned(),
+            });
         }
     }
 
     match matches.len() {
         0 => Ok(ShardLookup::NotFound),
         1 => Ok(ShardLookup::Found(matches.remove(0))),
-        _ => Ok(ShardLookup::Ambiguous(matches)),
+        _ => Ok(ShardLookup::Ambiguous(
+            matches.into_iter().map(|m| m.path).collect(),
+        )),
     }
 }
 
@@ -113,15 +181,38 @@ fn ambiguous_error(digest: &Sha256Digest, paths: &[PathBuf]) -> anyhow::Error {
     )
 }
 
-/// Run `pcas path <digest>`: parse and normalize the digest, scan only its
+/// A single packed object entry resolved for one digest: enough identity
+/// to open it once and derive both `pcas path`'s printed path and the HTTP
+/// digest route's representation metadata from that same descriptor.
+#[derive(Debug)]
+pub struct ResolvedDigest {
+    pub digest: Sha256Digest,
+    pub path: PathBuf,
+    pub suffix: Option<FileTypeSuffix>,
+}
+
+/// Resolve a raw digest string: parse and normalize it, scan only its
 /// shard directory, and return the single matching object entry. Never
-/// opens or creates `purecas.db`.
-pub fn resolve_digest_path(root: &Path, raw_digest: &str) -> Result<PathBuf> {
-    let digest = Sha256Digest::parse(raw_digest)?;
+/// opens or creates `purecas.db`. Used by both `pcas path` and the HTTP
+/// digest route; see [`DigestResolutionError`] for how failures are
+/// classified.
+pub fn resolve_digest(
+    root: &Path,
+    raw_digest: &str,
+) -> Result<ResolvedDigest, DigestResolutionError> {
+    let digest = Sha256Digest::parse(raw_digest).map_err(DigestResolutionError::NotFound)?;
     match scan_shard_for_digest(root, &digest)? {
-        ShardLookup::Found(path) => Ok(path),
-        ShardLookup::NotFound => bail!("no indexed object for digest {digest}"),
-        ShardLookup::Ambiguous(paths) => Err(ambiguous_error(&digest, &paths)),
+        ShardLookup::Found(m) => Ok(ResolvedDigest {
+            digest,
+            path: m.path,
+            suffix: m.suffix,
+        }),
+        ShardLookup::NotFound => Err(DigestResolutionError::NotFound(anyhow!(
+            "no indexed object for digest {digest}"
+        ))),
+        ShardLookup::Ambiguous(paths) => Err(DigestResolutionError::CorruptIndex(ambiguous_error(
+            &digest, &paths,
+        ))),
     }
 }
 
@@ -412,15 +503,15 @@ mod tests {
         let report = index_root(root, None, false).unwrap();
         let digest = &report.created[0].digest;
 
-        let resolved = resolve_digest_path(root, digest.as_str()).unwrap();
-        assert_eq!(resolved, report.created[0].object_path);
+        let resolved = resolve_digest(root, digest.as_str()).unwrap();
+        assert_eq!(resolved.path, report.created[0].object_path);
     }
 
     #[test]
     fn path_fails_for_malformed_digest() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        assert!(resolve_digest_path(root, "not-a-digest").is_err());
+        assert!(resolve_digest(root, "not-a-digest").is_err());
     }
 
     #[test]
@@ -428,7 +519,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         let unknown = "0".repeat(64);
-        assert!(resolve_digest_path(root, &unknown).is_err());
+        assert!(resolve_digest(root, &unknown).is_err());
     }
 
     #[test]
@@ -441,7 +532,8 @@ mod tests {
         fs::write(shard.join(format!("{digest}--20260722T130016Z")), b"x").unwrap();
         fs::write(shard.join(format!("{digest}--20260722T140000Z")), b"x").unwrap();
 
-        let err = resolve_digest_path(root, digest.as_str()).unwrap_err();
+        let err = resolve_digest(root, digest.as_str()).unwrap_err();
+        assert!(matches!(err, DigestResolutionError::CorruptIndex(_)));
         assert!(err.to_string().contains("ambiguous"));
     }
 
@@ -454,7 +546,7 @@ mod tests {
         fs::create_dir_all(&shard).unwrap();
         fs::write(shard.join("not-a-valid-object-name"), b"x").unwrap();
 
-        assert!(resolve_digest_path(root, digest.as_str()).is_err());
+        assert!(resolve_digest(root, digest.as_str()).is_err());
     }
 
     #[test]
@@ -464,7 +556,7 @@ mod tests {
         write(root, "file.bin", b"no sqlite here");
 
         let report = index_root(root, None, false).unwrap();
-        resolve_digest_path(root, report.created[0].digest.as_str()).unwrap();
+        resolve_digest(root, report.created[0].digest.as_str()).unwrap();
 
         assert!(!root.join("purecas.db").exists());
     }
@@ -547,8 +639,8 @@ mod tests {
 
         let visible_meta = fs::metadata(&file).unwrap();
         let expected_digest = crate::store::hash_file(&file).unwrap();
-        let object_path = resolve_digest_path(root, &expected_digest).unwrap();
-        let object_meta = fs::metadata(&object_path).unwrap();
+        let resolved = resolve_digest(root, &expected_digest).unwrap();
+        let object_meta = fs::metadata(&resolved.path).unwrap();
         assert_eq!(visible_meta.ino(), object_meta.ino());
     }
 
@@ -576,7 +668,7 @@ mod tests {
         assert_eq!(repaired.summary.repaired, 1);
 
         let expected_digest = crate::store::hash_file(&file).unwrap();
-        assert!(resolve_digest_path(root, &expected_digest).is_ok());
+        assert!(resolve_digest(root, &expected_digest).is_ok());
     }
 
     #[test]
@@ -596,7 +688,7 @@ mod tests {
         assert_eq!(report.summary.repaired, 1);
 
         let expected_digest = crate::store::hash_file(&file).unwrap();
-        assert!(resolve_digest_path(root, &expected_digest).is_ok());
+        assert!(resolve_digest(root, &expected_digest).is_ok());
     }
 
     #[test]
@@ -617,8 +709,8 @@ mod tests {
         let report = index_root(root, Some("*.does-not-match"), true).unwrap();
         assert_eq!(report.summary.repaired, 1);
         assert_eq!(report.summary.deduplicated, 0);
-        assert!(resolve_digest_path(root, &stale_digest).is_err());
-        assert!(resolve_digest_path(root, &canonical_digest).is_ok());
+        assert!(resolve_digest(root, &stale_digest).is_err());
+        assert!(resolve_digest(root, &canonical_digest).is_ok());
         assert_ne!(
             fs::metadata(&canonical).unwrap().ino(),
             fs::metadata(&changed).unwrap().ino(),

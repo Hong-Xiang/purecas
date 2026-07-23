@@ -185,8 +185,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Index { pattern, rehash } => return run_index(&root, pattern.as_deref(), rehash),
         Commands::Path { hash } => {
-            let path = purecas::index::resolve_digest_path(&root, &hash)?;
-            println!("{}", path.display());
+            let resolved = purecas::index::resolve_digest(&root, &hash)
+                .map_err(purecas::index::DigestResolutionError::into_anyhow)?;
+            println!("{}", resolved.path.display());
             return Ok(());
         }
         Commands::Serve { bind } => return purecas::serve::run_cli(&root, bind),
