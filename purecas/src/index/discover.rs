@@ -2,6 +2,7 @@
 //! basename/relative-path pattern matching.
 
 use super::types::RootRelativePath;
+use super::LEGACY_DATABASE_NAME;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobBuilder, GlobMatcher};
 use std::path::{Component, Path, PathBuf};
@@ -79,6 +80,12 @@ pub fn discover_files(root: &Path) -> Result<Vec<PathBuf>> {
 
     for entry in walker {
         let entry = entry.with_context(|| format!("walking {}", root.display()))?;
+        if entry.depth() == 1 && entry.file_name() == LEGACY_DATABASE_NAME {
+            bail!(
+                "legacy SQLite store detected at {}; migrate it or use a separate root before running `pcas index`",
+                entry.path().display()
+            );
+        }
         if entry.path_is_symlink() {
             continue;
         }
@@ -87,4 +94,20 @@ pub fn discover_files(root: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn discovery_rejects_top_level_legacy_database() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join(LEGACY_DATABASE_NAME), b"legacy sqlite").unwrap();
+
+        let error = discover_files(root.path()).unwrap_err();
+
+        assert!(error.to_string().contains("legacy SQLite store"));
+    }
 }
