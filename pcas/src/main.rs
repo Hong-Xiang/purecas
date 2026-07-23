@@ -100,6 +100,12 @@ enum Commands {
     },
     /// Run as a Git LFS custom transfer agent (stdin/stdout protocol)
     LfsAgent,
+    /// Serve the visible hierarchy over read-only HTTP
+    Serve {
+        /// Address to bind (default: 127.0.0.1:8000)
+        #[arg(long, default_value = "127.0.0.1:8000")]
+        bind: std::net::SocketAddr,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +180,8 @@ fn main() -> anyhow::Result<()> {
 
     // `index` and `path` operate purely on the packed filesystem object
     // layout under `.pcas`; they must never open or create `purecas.db`.
+    // `serve` is dispatched here too: it must never open or create
+    // `purecas.db` either, and never exposes it if it already exists.
     match cli.command {
         Commands::Index { pattern, rehash } => return run_index(&root, pattern.as_deref(), rehash),
         Commands::Path { hash } => {
@@ -181,13 +189,16 @@ fn main() -> anyhow::Result<()> {
             println!("{}", path.display());
             return Ok(());
         }
+        Commands::Serve { bind } => return purecas::serve::run_cli(&root, bind),
         _ => {}
     }
 
     let store = purecas::Store::open(&root)?;
 
     match cli.command {
-        Commands::Index { .. } | Commands::Path { .. } => unreachable!("handled above"),
+        Commands::Index { .. } | Commands::Path { .. } | Commands::Serve { .. } => {
+            unreachable!("handled above")
+        }
         Commands::AddPath { files, tags, meta } => {
             for file in &files {
                 let blob = store.add_path(file)?;

@@ -198,6 +198,35 @@ export CAS_ROOT=/data/models
 pcas add-path large_model.pth
 ```
 
+### Serving the visible hierarchy over HTTP
+
+`pcas serve` exposes every visible file and directory under `PCAS_ROOT` as
+a read-only HTTP server, binding to `127.0.0.1:8000` by default:
+
+```bash
+pcas serve
+# pcas serve: listening on http://127.0.0.1:8000
+
+pcas --root /data/models serve --bind 0.0.0.0:9000
+```
+
+```bash
+curl http://127.0.0.1:8000/datasets/train/001.bin
+curl http://127.0.0.1:8000/datasets/train/   # directory listing
+```
+
+`serve` is dispatched before `purecas.db` is ever opened, so it never
+creates or reads the legacy SQLite database, and it never exposes it if it
+already exists at the root. `.pcas` (the internal object store) and the
+top-level `/pcas` path (reserved for the future digest route) are never
+served; nested directories literally named `pcas` remain visible. `GET`
+and `HEAD` support full representation metadata (`Content-Length`,
+`Content-Type`, `Last-Modified`, `Accept-Ranges`, a weak `ETag`) and RFC
+9110 conditional requests (`If-Match`, `If-Unmodified-Since`,
+`If-None-Match`, `If-Modified-Since`). Byte-range requests, the
+`/pcas/<hash>` digest route, and a strong immutable `ETag` are deferred to
+a follow-up slice.
+
 ## Nix Integration
 
 purecas is designed to work with Nix flakes. The key idea: Nix handles reproducible toolchains and recipes, `pcas` handles content storage. Hashes are pre-calculated constants in nix expressions, just like fixed-output derivations -- but data lands in the CAS instead of `/nix/store`.
@@ -327,6 +356,7 @@ pkg.export("/tmp/export")
 - **SQLite metadata** -- lightweight, embedded, no external dependencies. Tracks filenames and package membership.
 - **Filesystem is the source of truth for content** -- the DB tracks metadata. `pcas path` and `pcas cat` work without a DB, only needing the blob files.
 - **No built-in transport** -- export/import produces/consumes directories. Use rsync, scp, or any tool for transfer. Git LFS integration is available for version-controlled workflows.
+- **`pcas serve` on axum/Tokio** -- the visible-hierarchy HTTP server (see above) uses current stable `axum`/Tokio, already present transitively through `reqwest`; every file is opened exactly once and representation metadata/body bytes both come from that same descriptor, so `tower-http`'s path-only `ServeFile`/`ServeDir` (which would reopen a path after deriving metadata) are deliberately not used. The async runtime is entered only for this command.
 - **No garbage collection (yet)** -- planned for a future release.
 
 ## Git LFS Integration

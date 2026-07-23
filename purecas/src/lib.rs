@@ -5,6 +5,7 @@ pub mod db;
 pub mod fetch;
 pub mod index;
 pub mod lfs;
+pub mod serve;
 pub mod store;
 pub mod transfer;
 
