@@ -8,6 +8,8 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use std::fmt;
+use std::fs::Metadata;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// A validated, lowercase, 64-hex-character SHA-256 digest.
@@ -128,6 +130,12 @@ impl IndexTimestamp {
             None => format!("{base}Z"),
             Some(f) => format!("{base}.{f}Z"),
         }
+    }
+
+    /// Nanoseconds since the Unix epoch, for direct comparison against a
+    /// file's mtime without going through calendar arithmetic.
+    pub fn unix_nanos(&self) -> i128 {
+        self.at.timestamp() as i128 * 1_000_000_000 + self.at.timestamp_subsec_nanos() as i128
     }
 }
 
@@ -335,6 +343,51 @@ impl fmt::Display for RootRelativePath {
     }
 }
 
+/// An immutable snapshot of the identity and content-relevant state of a
+/// file at one instant: device, inode, size, and nanosecond mtime.
+///
+/// Two snapshots of the same open file descriptor taken before and after a
+/// read detect in-place mutation, deletion-and-replacement, and any other
+/// change that would otherwise silently corrupt a computed digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileSnapshot {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+}
+
+impl FileSnapshot {
+    pub fn from_metadata(meta: &Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime_sec: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+
+    /// The `(device, inode)` identity key used to look up object entries.
+    pub fn inode_key(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+
+    /// Nanoseconds since the Unix epoch, for direct comparison against an
+    /// [`IndexTimestamp`].
+    pub fn mtime_unix_nanos(&self) -> i128 {
+        self.mtime_sec as i128 * 1_000_000_000 + self.mtime_nsec as i128
+    }
+
+    /// Whether this snapshot's mtime is at or before `timestamp`, the
+    /// non-adversarial trust condition for reusing an indexed inode's
+    /// digest without rehashing.
+    pub fn mtime_at_or_before(&self, timestamp: &IndexTimestamp) -> bool {
+        self.mtime_unix_nanos() <= timestamp.unix_nanos()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +591,34 @@ mod tests {
     #[test]
     fn root_relative_path_rejects_absolute() {
         assert!(RootRelativePath::from_relative(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    fn timestamp_unix_nanos_matches_known_instant() {
+        let ts = IndexTimestamp::parse("20260722T130016.139Z").unwrap();
+        // 2026-07-22T13:00:16.139Z; epoch seconds cross-checked with
+        // `date -u -d 2026-07-22T13:00:16Z +%s` = 1784725216.
+        assert_eq!(ts.unix_nanos(), 1_784_725_216_139_000_000);
+    }
+
+    #[test]
+    fn file_snapshot_mtime_at_or_before_boundary() {
+        let ts = IndexTimestamp::parse("20260722T130016Z").unwrap();
+        let equal = FileSnapshot {
+            dev: 1,
+            ino: 1,
+            size: 0,
+            mtime_sec: ts.at.timestamp(),
+            mtime_nsec: 0,
+        };
+        assert!(equal.mtime_at_or_before(&ts));
+
+        let mut later = equal;
+        later.mtime_sec += 1;
+        assert!(!later.mtime_at_or_before(&ts));
+
+        let mut earlier = equal;
+        earlier.mtime_sec -= 1;
+        assert!(earlier.mtime_at_or_before(&ts));
     }
 }

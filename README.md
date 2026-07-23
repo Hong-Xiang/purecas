@@ -74,13 +74,15 @@ pcas add-url https://example.com/dataset.zip --sha256 b7e4d9beef... --unzip
 
 If `--sha256` is provided and the downloaded file's hash doesn't match, the command fails and nothing is stored.
 
-### Filesystem object index (in progress)
+### Filesystem object index
 
 purecas is transitioning to a filesystem-first design (see the design
-issue for the full plan). The new `pcas index` command discovers regular
-files under `PCAS_ROOT` and creates one hard-linked object entry per
-distinct SHA-256 digest under `.pcas/sha256/<first2>/`, without touching
-`purecas.db`:
+issue for the full plan). `pcas index` is the single reconciliation
+command: it discovers regular files under `PCAS_ROOT`, hashes and
+deduplicates their content onto one hard-linked object entry per distinct
+SHA-256 digest under `.pcas/sha256/<first2>/`, repairs object entries
+whose bytes changed, and prunes entries with no remaining hard link.
+It never touches `purecas.db`.
 
 ```bash
 # Index every visible file under the CAS root
@@ -90,7 +92,33 @@ pcas index
 # contains a '/')
 pcas index '*.mp4'
 pcas index 'datasets/train/*.bin'
+
+# Force full content verification instead of trusting an indexed file's
+# mtime (see the caveat below)
+pcas index --rehash
 ```
+
+The command takes an exclusive, non-blocking lock on `.pcas/index.lock`
+for its entire run; a concurrent `pcas index` fails immediately instead
+of racing. It prints one line per newly created object entry, then a
+summary:
+
+```text
+indexed=1 reused=2 deduplicated=1 repaired=0 pruned=0 failed=0
+```
+
+Any independent per-path failure (an unreadable or unstable file, a
+failed link/rename/verify, or a failed prune) is printed to stderr;
+`pcas index` still processes every other path, but exits non-zero
+whenever `failed > 0`.
+
+**Non-adversarial mtime caveat:** to avoid rehashing unchanged content on
+every run, an already-indexed file is trusted without hashing when its
+mtime is not later than the time it was indexed. This is intentionally
+not adversarial: a tool that preserves or backdates mtime across a
+content change (`cp -p`, `rsync -a`, some archive extractors) can defeat
+it silently. Run `pcas index --rehash` after using such a tool, or
+whenever you need a guaranteed full verification.
 
 `pcas path <hash>` (below) now resolves exclusively against these
 `.pcas` object entries: it requires the content to have been indexed with

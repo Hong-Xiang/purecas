@@ -15,3 +15,6 @@ anyhow = "1"
 walkdir = "2.5.0"
 globset = "0.4.19"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+filetime = "0.2"

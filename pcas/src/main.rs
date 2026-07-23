@@ -50,6 +50,10 @@ enum Commands {
         /// Optional glob pattern; without `/` matches basenames recursively,
         /// with `/` matches root-relative paths. Omit to index everything.
         pattern: Option<String>,
+        /// Force full content verification of every matched visible file
+        /// and every retained object entry, bypassing the mtime fast path.
+        #[arg(long)]
+        rehash: bool,
     },
     /// Package operations
     Pkg {
@@ -144,8 +148,8 @@ fn resolve_root(cli_root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join("data").join("blob"))
 }
 
-fn run_index(root: &Path, pattern: Option<&str>) -> anyhow::Result<()> {
-    let report = purecas::index::index_root(root, pattern)?;
+fn run_index(root: &Path, pattern: Option<&str>, rehash: bool) -> anyhow::Result<()> {
+    let report = purecas::index::index_root(root, pattern, rehash)?;
     for indexed in &report.created {
         println!(
             "{}  {}  {}",
@@ -154,7 +158,13 @@ fn run_index(root: &Path, pattern: Option<&str>) -> anyhow::Result<()> {
             indexed.object_path.display()
         );
     }
+    for failure in &report.failures {
+        eprintln!("{failure}");
+    }
     println!("{}", report.summary);
+    if report.summary.failed > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -165,7 +175,7 @@ fn main() -> anyhow::Result<()> {
     // `index` and `path` operate purely on the packed filesystem object
     // layout under `.pcas`; they must never open or create `purecas.db`.
     match cli.command {
-        Commands::Index { pattern } => return run_index(&root, pattern.as_deref()),
+        Commands::Index { pattern, rehash } => return run_index(&root, pattern.as_deref(), rehash),
         Commands::Path { hash } => {
             let path = purecas::index::resolve_digest_path(&root, &hash)?;
             println!("{}", path.display());

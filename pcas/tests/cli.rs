@@ -157,10 +157,7 @@ fn test_index_is_idempotent() {
         .args(["index"])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("indexed=0")
-                .and(predicate::str::contains("already_indexed=1")),
-        );
+        .stdout(predicate::str::contains("indexed=0").and(predicate::str::contains("reused=1")));
 }
 
 #[test]
@@ -175,8 +172,7 @@ fn test_index_deduplicates_identical_content_in_one_run() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("indexed=1")
-                .and(predicate::str::contains("already_indexed=1")),
+            predicate::str::contains("indexed=1").and(predicate::str::contains("deduplicated=1")),
         );
 }
 
@@ -184,9 +180,16 @@ fn test_index_deduplicates_identical_content_in_one_run() {
 fn test_index_excludes_dot_pcas() {
     let root = cas_root();
     fs::write(root.path().join("visible.txt"), b"visible").unwrap();
-    let stray_dir = root.path().join(".pcas").join("sha256").join("aa");
-    fs::create_dir_all(&stray_dir).unwrap();
-    fs::write(stray_dir.join("stray-file"), b"should not be walked").unwrap();
+    // A pre-existing, well-formed but unreferenced object entry is valid
+    // store state; it must never be treated as a discovered visible file.
+    let digest = "c".repeat(64);
+    let shard = root.path().join(".pcas").join("sha256").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(
+        shard.join(format!("{digest}--20260722T130016Z")),
+        b"stray object bytes",
+    )
+    .unwrap();
 
     pcas()
         .args(["--root", root.path().to_str().unwrap()])
@@ -236,6 +239,87 @@ fn test_index_rejects_absolute_pattern() {
         .args(["index", "/etc/passwd"])
         .assert()
         .failure();
+}
+
+#[test]
+fn test_index_rehash_flag_repairs_preserved_mtime_mutation() {
+    use filetime::FileTime;
+
+    let root = cas_root();
+    let file = root.path().join("mutate.bin");
+    fs::write(&file, b"before").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=1"));
+
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&file).unwrap());
+    fs::write(&file, b"after-mutation-longer").unwrap();
+    filetime::set_file_mtime(&file, original_mtime).unwrap();
+
+    // Without --rehash, the preserved mtime hides the mutation.
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reused=1").and(predicate::str::contains("repaired=0")));
+
+    // --rehash always verifies content and repairs the stale object entry.
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index", "--rehash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repaired=1"));
+
+    let expected_hash = sha256_hex(b"after-mutation-longer");
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["path", &expected_hash])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_index_reports_failures_and_exits_nonzero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = cas_root();
+    let bad = root.path().join("bad.bin");
+    fs::write(&bad, b"unreadable").unwrap();
+    fs::write(root.path().join("good.bin"), b"good content").unwrap();
+
+    let mut perms = fs::metadata(&bad).unwrap().permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&bad, perms).unwrap();
+
+    let output = pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .failure();
+
+    // Restore permissions unconditionally so the TempDir cleans up.
+    let mut restore = fs::metadata(&bad).unwrap().permissions();
+    restore.set_mode(0o644);
+    fs::set_permissions(&bad, restore).unwrap();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("indexed=1"));
+    assert!(stdout.contains("failed=1"));
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("bad.bin"));
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 #[test]
