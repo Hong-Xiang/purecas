@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +44,12 @@ enum Commands {
     Path {
         /// SHA-256 hash
         hash: String,
+    },
+    /// Discover and index visible regular files under the CAS root
+    Index {
+        /// Optional glob pattern; without `/` matches basenames recursively,
+        /// with `/` matches root-relative paths. Omit to index everything.
+        pattern: Option<String>,
     },
     /// Package operations
     Pkg {
@@ -138,12 +144,40 @@ fn resolve_root(cli_root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join("data").join("blob"))
 }
 
+fn run_index(root: &Path, pattern: Option<&str>) -> anyhow::Result<()> {
+    let report = purecas::index::index_root(root, pattern)?;
+    for indexed in &report.created {
+        println!(
+            "{}  {}  {}",
+            indexed.digest,
+            indexed.relative_path,
+            indexed.object_path.display()
+        );
+    }
+    println!("{}", report.summary);
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let root = resolve_root(cli.root)?;
+
+    // `index` and `path` operate purely on the packed filesystem object
+    // layout under `.pcas`; they must never open or create `purecas.db`.
+    match cli.command {
+        Commands::Index { pattern } => return run_index(&root, pattern.as_deref()),
+        Commands::Path { hash } => {
+            let path = purecas::index::resolve_digest_path(&root, &hash)?;
+            println!("{}", path.display());
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let store = purecas::Store::open(&root)?;
 
     match cli.command {
+        Commands::Index { .. } | Commands::Path { .. } => unreachable!("handled above"),
         Commands::AddPath { files, tags, meta } => {
             for file in &files {
                 let blob = store.add_path(file)?;
@@ -189,11 +223,6 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", blob.hash());
                 }
             }
-            Ok(())
-        }
-        Commands::Path { hash } => {
-            let blob = store.blob(&hash);
-            println!("{}", blob.path().display());
             Ok(())
         }
         Commands::Pkg { command } => match command {
