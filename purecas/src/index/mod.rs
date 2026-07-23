@@ -600,6 +600,33 @@ mod tests {
     }
 
     #[test]
+    fn rehash_removes_pattern_excluded_stale_object_when_digest_is_already_canonical() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let canonical = write(root, "canonical.bin", b"canonical content");
+        let changed = write(root, "changed.bin", b"different content");
+        index_root(root, None, false).unwrap();
+
+        let stale_digest = crate::store::hash_file(&changed).unwrap();
+        let canonical_digest = crate::store::hash_file(&canonical).unwrap();
+        let original_mtime =
+            FileTime::from_last_modification_time(&fs::metadata(&changed).unwrap());
+        fs::write(&changed, b"canonical content").unwrap();
+        filetime::set_file_mtime(&changed, original_mtime).unwrap();
+
+        let report = index_root(root, Some("*.does-not-match"), true).unwrap();
+        assert_eq!(report.summary.repaired, 1);
+        assert_eq!(report.summary.deduplicated, 0);
+        assert!(resolve_digest_path(root, &stale_digest).is_err());
+        assert!(resolve_digest_path(root, &canonical_digest).is_ok());
+        assert_ne!(
+            fs::metadata(&canonical).unwrap().ino(),
+            fs::metadata(&changed).unwrap().ino(),
+            "an unselected visible link remains ordinary unindexed content"
+        );
+    }
+
+    #[test]
     fn rehash_leaves_unchanged_object_name_and_timestamp_intact() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
