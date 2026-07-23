@@ -15,6 +15,17 @@ anyhow = "1"
 walkdir = "2.5.0"
 globset = "0.4.19"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "net", "fs", "io-util"] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["io"] }
+headers = "0.4.1"
+mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
+askama_escape = "0.16.0"
+http = "1.4.2"
 
 [dev-dependencies]
 filetime = "0.2"
+http-body-util = "0.1.4"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tower = { version = "0.5.3", features = ["util"] }

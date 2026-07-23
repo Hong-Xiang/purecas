@@ -749,3 +749,50 @@ fn test_lfs_agent_download_missing() {
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains(r#""error"#));
 }
+
+#[test]
+fn test_serve_binds_and_serves_a_file_over_http_without_touching_purecas_db() {
+    use std::io::{BufRead, Read, Write};
+
+    let root = cas_root();
+    fs::create_dir_all(root.path().join("sub")).unwrap();
+    fs::write(root.path().join("sub/file.txt"), b"served bytes").unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pcas"))
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning `pcas serve`");
+
+    // The server prints its bound ephemeral address to stderr before
+    // accepting connections; `serve` is dispatched before `Store::open`, so
+    // this line appears without ever creating `purecas.db`.
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("reading server startup line");
+    assert!(line.contains("listening on http://"), "{line}");
+    let addr = line.trim().rsplit("http://").next().unwrap().to_string();
+
+    let mut stream = std::net::TcpStream::connect(&addr).expect("connecting to pcas serve");
+    write!(
+        stream,
+        "GET /sub/file.txt HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("served bytes"), "{response}");
+    assert!(
+        !root.path().join("purecas.db").exists(),
+        "serve must never create purecas.db"
+    );
+
+    child.kill().expect("killing server process");
+    child.wait().expect("waiting for server process to exit");
+}
