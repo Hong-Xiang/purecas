@@ -1,8 +1,17 @@
 # purecas
 
-Content-addressable storage for managing large binary datasets and model weights. Inspired by Nix, but designed for files that don't belong in `/nix/store`.
+Content-addressable storage for large binary datasets and model weights.
 
-Files are stored by their SHA-256 hash. Identical content is never duplicated. Packages group related blobs (e.g., all files in a dataset) for easy management and transfer.
+purecas is **filesystem-first**: you organize content as an ordinary
+directory hierarchy using whatever tools you already use (`cp`, `mkdir`,
+`rsync`, Nix, dataloaders, etc.), and `pcas index` builds an immutable,
+content-addressed lookup index alongside it using hard links. There is no
+copy step and no database standing between you and your files.
+
+> An older, database-backed design (`<root>/sha256/...` plus a
+> `purecas.db` SQLite file) is being phased out. See
+> [Legacy surfaces and the transition](#legacy-surfaces-and-the-transition)
+> for what still uses it and why it cannot be mixed with the model below.
 
 ## Installation
 
@@ -15,7 +24,7 @@ nix run github:Hong-Xiang/purecas#pcas -- --help
 # Install into profile
 nix profile install github:Hong-Xiang/purecas#pcas
 
-# Or add to a flake as an input (see "Nix Integration" below)
+# Or add to a flake as an input (see "Building hierarchy with Nix" below)
 ```
 
 ### From source
@@ -36,72 +45,101 @@ The CAS root directory is resolved in this order:
 2. `$CAS_ROOT` environment variable
 3. `~/data/blob` (default)
 
-### Storage layout
+Design notes and this README sometimes write `PCAS_ROOT` as shorthand for
+"whichever root the command above resolves to." It is prose notation only
+— there is no `PCAS_ROOT` environment variable. The real, implemented
+resolution is `--root`, then `CAS_ROOT`, then the `~/data/blob` default.
 
+## The filesystem-first model
+
+```text
+<root>/                        # resolved as described above
+  datasets/
+    dataset=kinetics/
+      split=train/
+        video-001.mp4          # ordinary file, organize however you like
+  models/
+    model=resnet50/
+      weights.safetensors
+  .pcas/
+    sha256/
+      <first 2 hex chars>/
+        <64-hex-digest>--<UTC index time>[.<suffix>]
+    index.lock
+    tmp/
 ```
-<CAS_ROOT>/
-  sha256/<first 2 hex chars>/<full sha256 hash>   # blob files (read-only, 0o444)
-  purecas.db                                        # SQLite metadata
-```
 
-## Usage
+- **Visible tree** — everything under the root except `.pcas`. These are
+  ordinary files: read them, copy them, feed them to a dataloader, keep
+  them under version control metadata, whatever you'd do with any other
+  file. Directory structure and naming are yours to choose; purecas has
+  no opinion about it.
+- **`.pcas/sha256/<first2>/<digest>--<index-time>[.<suffix>]`** — exactly
+  one entry per indexed SHA-256 digest. This entry is a **hard link**,
+  not a copy: it shares an inode (and therefore bytes, ownership,
+  permissions, and timestamps) with every visible file indexed to that
+  digest. `<index-time>` is a UTC timestamp recording when the content
+  was first hashed to this digest, not a filesystem ctime/mtime.
+  `<suffix>` is an optional, sanitized, best-effort extension hint taken
+  from the first visible filename indexed for that digest.
+- **`.pcas/index.lock`** — an exclusive advisory lock held for the
+  duration of a `pcas index` run so two indexing processes can't race.
+- **`.pcas/tmp/`** — scratch space used internally for atomic
+  rename-based deduplication.
+- **`.pcas` is entirely derived state.** Deleting it loses lookup
+  acceleration, never visible content; the next `pcas index` rebuilds it.
+- **Indexed content is immutable by contract.** Because a digest name and
+  every deduplicated visible path share one inode, editing a file in
+  place changes every link to it simultaneously and invalidates the old
+  digest name. purecas treats in-place mutation as exceptional damage,
+  not a supported workflow — replace a file via write-to-temp-then-rename
+  and re-run `pcas index` instead.
 
-### Adding files
+## Core workflow: build hierarchy, then index
+
+Use ordinary filesystem tools to create the layout you want, then index it:
 
 ```bash
-# Add one or more files to the store
-pcas add-path model.pth dataset.zip
-
-# Output: <sha256 hash> <filename> per file
-# a3f2c1dead...  model.pth
-# b7e4d9beef...  dataset.zip
-```
-
-Adding is idempotent -- re-adding the same file content is a no-op (but a new filename is still recorded).
-
-### Fetching from a URL
-
-```bash
-# Download, verify SHA-256, and store
-pcas add-url https://example.com/weights.pth --sha256 a3f2c1dead...
-
-# Download without hash verification (hash computed after download)
-pcas add-url https://example.com/weights.pth
-
-# Download a zip, verify, extract, and store each file individually
-pcas add-url https://example.com/dataset.zip --sha256 b7e4d9beef... --unzip
-```
-
-If `--sha256` is provided and the downloaded file's hash doesn't match, the command fails and nothing is stored.
-
-### Filesystem object index
-
-purecas is transitioning to a filesystem-first design (see the design
-issue for the full plan). `pcas index` is the single reconciliation
-command: it discovers regular files under `PCAS_ROOT`, hashes and
-deduplicates their content onto one hard-linked object entry per distinct
-SHA-256 digest under `.pcas/sha256/<first2>/`, repairs object entries
-whose bytes changed, and prunes entries with no remaining hard link.
-It never touches `purecas.db`.
-
-```bash
-# Index every visible file under the CAS root
+mkdir -p ~/data/blob/datasets/train
+cp video-001.mp4 ~/data/blob/datasets/train/
 pcas index
+```
 
-# Index only files matching a pattern (basename, or root-relative if it
-# contains a '/')
-pcas index '*.mp4'
-pcas index 'datasets/train/*.bin'
+```text
+a3f2c1dead...  datasets/train/video-001.mp4  /home/user/data/blob/.pcas/sha256/a3/a3f2c1dead...--20260722T130016.139Z.mp4
+indexed=1 reused=0 deduplicated=0 repaired=0 pruned=0 failed=0
+```
 
-# Force full content verification instead of trusting an indexed file's
-# mtime (see the caveat below)
-pcas index --rehash
+### `pcas index`
+
+```bash
+pcas [--root ROOT] index [PATTERN] [--rehash]
+```
+
+`pcas index` is the single reconciliation command: it discovers regular
+files under the root, hashes and deduplicates their content onto one
+hard-linked object entry per distinct SHA-256 digest, repairs object
+entries whose bytes changed, and prunes entries with no remaining hard
+link. It never reads or creates `purecas.db`.
+
+- Omit `PATTERN` to index every regular file in the visible tree.
+- A pattern without `/` (e.g. `*.mp4`) matches basenames recursively.
+- A pattern containing `/` (e.g. `datasets/train/*.bin`) matches paths
+  relative to the root.
+- `.pcas` is always excluded. Symlinks, directories, sockets, devices,
+  and FIFOs are never indexed, and symlinks are not followed.
+
+```bash
+pcas index                          # index everything
+pcas index '*.mp4'                  # index matching basenames, recursively
+pcas index 'datasets/train/*.bin'   # index a root-relative pattern
+pcas index --rehash                 # force full content verification
 ```
 
 The command takes an exclusive, non-blocking lock on `.pcas/index.lock`
-for its entire run; a concurrent `pcas index` fails immediately instead
-of racing. It prints one line per newly created object entry, then a
-summary:
+for its entire run; a concurrent `pcas index` fails immediately instead of
+racing. It prints one line per newly created object entry
+(`<digest>  <relative-path>  <object-path>`), then a summary:
 
 ```text
 indexed=1 reused=2 deduplicated=1 repaired=0 pruned=0 failed=0
@@ -112,96 +150,59 @@ failed link/rename/verify, or a failed prune) is printed to stderr;
 `pcas index` still processes every other path, but exits non-zero
 whenever `failed > 0`.
 
-**Non-adversarial mtime caveat:** to avoid rehashing unchanged content on
+**Non-adversarial mtime caveat.** To avoid rehashing unchanged content on
 every run, an already-indexed file is trusted without hashing when its
 mtime is not later than the time it was indexed. This is intentionally
 not adversarial: a tool that preserves or backdates mtime across a
 content change (`cp -p`, `rsync -a`, some archive extractors) can defeat
 it silently. Run `pcas index --rehash` after using such a tool, or
-whenever you need a guaranteed full verification.
+whenever you need a guaranteed full verification — `--rehash` hashes
+every matched visible file and every retained object entry, bypassing the
+mtime fast path.
 
-`pcas path <hash>` (below) now resolves exclusively against these
-`.pcas` object entries: it requires the content to have been indexed with
-`pcas index` first, fails if the digest is unknown, and never opens
-`purecas.db`. It is no longer related to `pcas add-path`'s `sha256/`
+**Legacy root refusal.** `pcas index` refuses to run against any root
+containing a top-level `purecas.db` (file, directory, or symlink),
+checked before `.pcas` is created or any content is touched:
+
+```text
+Error: legacy SQLite store detected at /home/user/data/blob/purecas.db; migrate it or use a separate root before running `pcas index`
+```
+
+This exists because a legacy command can later rewrite `purecas.db` in
+place; if it had already been hard-linked into `.pcas` as ordinary
+content, that write would silently corrupt an entry served under an
+immutable digest identity. See
+[Legacy surfaces and the transition](#legacy-surfaces-and-the-transition).
+A top-level `sha256/` directory alone is *not* rejected — it can be
+legitimate visible hierarchy that has nothing to do with the legacy
 layout.
 
-### Looking up files
+### `pcas path`
 
 ```bash
-# Print the filesystem path for a hash indexed with `pcas index`
+pcas [--root ROOT] path <digest>
+```
+
+Resolves a hex SHA-256 digest to its packed `.pcas` object path. The
+content must already have been indexed with `pcas index`; an unknown
+digest fails.
+
+```bash
 pcas path a3f2c1dead...
-# /home/user/data/blob/.pcas/sha256/a3/a3f2c1dead...--20260722T130016.139Z
+# /home/user/data/blob/.pcas/sha256/a3/a3f2c1dead...--20260722T130016.139Z.mp4
 
-# Read blob contents via shell pipe
-cat $(pcas path a3f2c1dead...) > restored_file.pth
+cat "$(pcas path a3f2c1dead...)" > restored_file.mp4
 ```
 
-### Packages
-
-Packages group related blobs under a name. They are metadata-only -- removing a package does not delete the blob files.
+### `pcas serve`
 
 ```bash
-# Create a package
-pcas pkg create sbd-rai --description "SBD RAI shot boundary dataset"
-
-# Add blobs to a package with optional logical paths
-pcas pkg add sbd-rai a3f2c1dead... --path "videos/001.mp4"
-pcas pkg add sbd-rai b7e4d9beef... --path "annotations/scene_001.txt"
-
-# Add multiple blobs at once (no --path in this case)
-pcas pkg add sbd-rai hash1 hash2 hash3
-
-# List all packages
-pcas pkg list
-# sbd-rai    2 blobs
-
-# Show blobs in a package
-pcas pkg show sbd-rai
-# a3f2c1dead...  videos/001.mp4 (001.mp4)
-# b7e4d9beef...  annotations/scene_001.txt (scene_001.txt)
-
-# Remove a package (blobs remain in the store)
-pcas pkg rm sbd-rai
+pcas [--root ROOT] serve [--bind ADDRESS]
 ```
 
-### Exporting and importing
-
-Export copies blobs to a directory (preserving the `sha256/` layout) along with a `purecas-export.json` metadata file. Import reads from that directory with merge semantics.
-
-```bash
-# Export a package
-pcas export sbd-rai --to /mnt/drive/sbd-export/
-
-# Copy individual blobs with shell
-cp $(pcas path a3f2c1dead...) /tmp/blobs/
-
-# Transfer using any tool you like
-rsync -a /mnt/drive/sbd-export/ remote:/tmp/sbd-import/
-# or: scp, cp, USB drive, etc.
-
-# Import on the destination machine
-pcas import --from /tmp/sbd-import/
-# Imported 2 blob(s) from /tmp/sbd-import/
-```
-
-Import merges with existing data: packages gain new blobs, blob names are extended, nothing is overwritten.
-
-### Using a custom root
-
-```bash
-# Per-command override
-pcas --root /data/models add-path large_model.pth
-
-# Or set the environment variable
-export CAS_ROOT=/data/models
-pcas add-path large_model.pth
-```
-
-### Serving the visible hierarchy over HTTP
-
-`pcas serve` exposes every visible file and directory under `PCAS_ROOT` as
-a read-only HTTP server, binding to `127.0.0.1:8000` by default:
+Exposes the visible hierarchy and immutable digest access as a read-only
+HTTP server, binding to `127.0.0.1:8000` by default (loopback-only,
+because this server has no authentication or TLS):
 
 ```bash
 pcas serve
@@ -211,51 +212,97 @@ pcas --root /data/models serve --bind 0.0.0.0:9000
 ```
 
 ```bash
-curl http://127.0.0.1:8000/datasets/train/001.bin
-curl http://127.0.0.1:8000/datasets/train/   # directory listing
-curl http://127.0.0.1:8000/pcas/<64-hex-sha256>  # immutable digest access
+curl http://127.0.0.1:8000/datasets/train/video-001.mp4   # hierarchy route
+curl http://127.0.0.1:8000/datasets/train/                # directory listing
+curl http://127.0.0.1:8000/pcas/<64-hex-sha256>            # digest route
 ```
 
-`serve` is dispatched before `purecas.db` is ever opened, so it never
-creates or reads the legacy SQLite database, and it never exposes it if it
-already exists at the root. `.pcas` (the internal object store) is never
-served; nested directories literally named `pcas` remain visible.
+`serve` never opens or creates `purecas.db`, and never exposes it if it
+already exists at the root: a top-level `purecas.db` is not served over
+the hierarchy route. `.pcas` itself is never served either; a directory
+that happens to be literally named `pcas` (not `.pcas`) elsewhere in the
+tree remains visible.
 
-Every visible file and every resolved digest is opened exactly once, and
-representation metadata and body bytes both come from that same
-descriptor. `GET`/`HEAD` on either route return full representation
-metadata (`Content-Length`, `Content-Type`, `Last-Modified`,
-`Accept-Ranges`) and support RFC 9110 conditional requests (`If-Match`,
-`If-Unmodified-Since`, `If-None-Match`, `If-Modified-Since`) and RFC 9110
-byte-range requests (`Range`, `If-Range`), including single and
-`multipart/byteranges` responses.
+Both routes open the resolved file exactly once, so representation
+metadata and body bytes always come from the same descriptor. `GET`/`HEAD`
+on either route return full representation metadata (`Content-Length`,
+`Content-Type`, `Last-Modified`, `Accept-Ranges`) and support RFC 9110
+conditional requests (`If-Match`, `If-Unmodified-Since`, `If-None-Match`,
+`If-Modified-Since`) and RFC 9110 byte-range requests (`Range`,
+`If-Range`), including single-range and `multipart/byteranges` responses.
+Unsupported methods return `405 Method Not Allowed` with
+`Allow: GET, HEAD`.
 
 The two routes differ only in identity, cache policy, and MIME hints:
 
-- **Visible hierarchy** (`/datasets/train/001.bin`): a weak `ETag` derived
-  from the descriptor's device/inode/size/mtime, `Cache-Control: no-cache`
-  (content at a path can change), and MIME guessed from the visible file
-  name.
+- **Hierarchy route** (`/datasets/train/video-001.mp4`) — a weak `ETag`
+  derived from the descriptor's device/inode/size/mtime,
+  `Cache-Control: no-cache` (content at a path can be replaced), and MIME
+  guessed from the visible filename. Directory requests redirect to a
+  trailing slash, serve `index.html` when present, and otherwise return a
+  deterministic read-only directory listing that excludes `.pcas`,
+  HTML-escapes names, and percent-encodes links. Path resolution
+  percent-decodes exactly once and rejects NUL, `..`, platform path
+  prefixes, malformed encodings, and root escapes; symlinks may resolve
+  only when their final canonical target stays inside the visible tree.
 - **Digest route** (`/pcas/<64-hex-sha256>`, exact match only — a bare
-  `/pcas`, a trailing slash, or an extra segment all `404`): accepts
+  `/pcas`, a trailing slash, or an extra segment all `404`) — accepts
   either hex case and normalizes it, a strong `ETag` of exactly
   `"<lowercase-digest>"`, `Cache-Control: public, max-age=31536000,
   immutable` (content is immutable by contract; in-place mutation is
-  store damage, repaired by `pcas index`), and MIME guessed from the
-  packed object's suffix (falling back to `application/octet-stream`).
+  store damage, repaired by the next `pcas index`), and MIME guessed from
+  the packed object's suffix (falling back to `application/octet-stream`).
   An unknown or malformed digest is `404`; a corrupt or ambiguous packed
-  index entry is `500` without leaking host paths.
+  entry is `500` without leaking host paths.
 
-Because the digest `ETag` is strong, `If-Range` there can be satisfied by
-an entity-tag; the hierarchy route's `ETag` is always weak, so an
-entity-tag `If-Range` there always falls back to the full representation
-(`HTTP-date`-based `If-Range` works on both routes).
+Because the digest route's `ETag` is strong, an entity-tag `If-Range`
+there can be satisfied directly; the hierarchy route's `ETag` is always
+weak, so an entity-tag `If-Range` there always falls back to the full
+representation (an `HTTP-date`-based `If-Range` works on both routes).
 
-## Nix Integration
+## Filesystem behavior and limitations
 
-purecas is designed to work with Nix flakes. The key idea: Nix handles reproducible toolchains and recipes, `pcas` handles content storage. Hashes are pre-calculated constants in nix expressions, just like fixed-output derivations -- but data lands in the CAS instead of `/nix/store`.
+- **Immutability.** Hard links make the digest name and every
+  deduplicated visible path reference one inode; in-place writes change
+  all of them simultaneously and invalidate the old digest name. Treat
+  this as exceptional damage repaired by the next `pcas index`, not a
+  supported mutation path. purecas does not change file modes as an
+  enforcement mechanism — filesystem permissions remain an operator
+  policy.
+- **Same-filesystem only.** Hard links cannot cross filesystem
+  boundaries. A mount nested under the root can violate this even though
+  its path is lexically inside the root; `pcas index` reports the path
+  and device mismatch, leaves the file unchanged, and exits non-zero
+  after processing every other independent path. There is no silent
+  copy fallback.
+- **Shared inode metadata.** Hard links share ownership, permission
+  bits, mtime/ctime, ACLs, xattrs, and other inode-level state. When two
+  content-identical but metadata-different files are deduplicated, the
+  existing object inode wins; the newer path adopts its metadata.
+  Applications that need path-specific inode metadata are outside this
+  storage model.
+- **Deletion and pruning.** Deleting a visible path just decrements its
+  inode's link count; the `.pcas` object entry keeps the bytes alive
+  until the next `pcas index`, which removes an object entry once its
+  freshly re-checked link count is exactly 1. Deleting `.pcas` entirely
+  removes indexed lookup links (and may let now-unreferenced content be
+  pruned later) but never invalidates visible paths.
+- **Copies aren't references until indexed.** A byte-for-byte copy is
+  just another ordinary file until the next `pcas index` hashes it and
+  replaces it with a hard link to the existing object inode.
+- **Packed lookup is a bounded shard scan, not a single `open`.** Because
+  the index time and suffix follow the digest in the filename, `pcas
+  path`/the digest HTTP route look up an entry by scanning the small
+  `.pcas/sha256/<first2>/` shard directory for the matching 64-hex-digest
+  prefix, rather than opening one exact path. Multiple matching entries
+  in a shard are store corruption, reported rather than silently
+  resolved — run `pcas index --rehash` to repair.
 
-### Adding purecas to a project flake
+## Building hierarchy with Nix
+
+Nix recipes materialize data into ordinary visible paths, and `pcas
+index` indexes the result — the same "materialize, then index" pattern
+as any other tool:
 
 ```nix
 {
@@ -269,29 +316,23 @@ purecas is designed to work with Nix flakes. The key idea: Nix handles reproduci
       pkgs = import nixpkgs { system = "x86_64-linux"; };
       pcas = purecas.packages.x86_64-linux.default;
     in {
-      # Dataset fetch scripts as flake apps
       apps.x86_64-linux.fetch-sbd = {
         type = "app";
         program = toString (pkgs.writeShellScript "fetch-sbd" ''
           set -euo pipefail
 
-          # Hashes are pre-calculated (like nix fixed-output derivations)
-          ${pcas}/bin/pcas add-url "https://example.com/sbd-videos.zip" \
-            --sha256 a3f2c1deadbeef... --unzip
-          ${pcas}/bin/pcas add-url "https://example.com/sbd-annotations.zip" \
-            --sha256 b7e4d9beefcafe... --unzip
+          root="''${CAS_ROOT:-$HOME/data/blob}"
+          mkdir -p "$root/datasets/sbd-rai/videos" "$root/datasets/sbd-rai/annotations"
 
-          # Organize into a package
-          ${pcas}/bin/pcas pkg create sbd-rai \
-            --description "SBD RAI shot boundary dataset"
-          ${pcas}/bin/pcas pkg add sbd-rai a3f2c1deadbeef... \
-            --path "videos/001.mp4"
-          ${pcas}/bin/pcas pkg add sbd-rai b7e4d9beefcafe... \
-            --path "annotations/scene_001.txt"
+          ${pkgs.curl}/bin/curl -fsSL -o "$root/datasets/sbd-rai/videos/001.mp4" \
+            https://example.com/sbd-videos/001.mp4
+          ${pkgs.curl}/bin/curl -fsSL -o "$root/datasets/sbd-rai/annotations/scene_001.txt" \
+            https://example.com/sbd-annotations/scene_001.txt
+
+          ${pcas}/bin/pcas --root "$root" index 'datasets/sbd-rai/*'
         '');
       };
 
-      # Include pcas in the dev shell
       devShells.x86_64-linux.default = pkgs.mkShell {
         buildInputs = [ pcas ];
       };
@@ -299,97 +340,61 @@ purecas is designed to work with Nix flakes. The key idea: Nix handles reproduci
 }
 ```
 
-### Using dataset recipes
-
 ```bash
-# Download and organize a dataset (recipe is reproducible via nix)
+# Materialize the visible hierarchy and index it (recipe is reproducible via Nix)
 nix run .#fetch-sbd
 
-# Use the stored files
-pcas pkg show sbd-rai
-pcas path a3f2c1deadbeef...    # get filesystem path to use in scripts
+# Use the stored files directly, or via their indexed digest
+cat ~/data/blob/datasets/sbd-rai/videos/001.mp4
+pcas path <digest-printed-by-index>
 ```
 
-## Development
+Do not combine this pattern with legacy ingestion commands
+(`add-path`/`add-url`/`pkg`) in the same root — see the next section.
 
-```bash
-nix develop            # enter dev shell
-cargo build            # build
-cargo test             # run all tests (54 unit + 19 integration)
-cargo clippy           # lint
-cargo fmt              # format
-nix build .#pcas       # nix build
-```
+## Legacy surfaces and the transition
 
-## Library Usage (Rust)
+An earlier design stored content under `<root>/sha256/<first2>/<hash>`
+(read-only, `0o444`) with all naming, package membership, tags, and
+relations tracked only in a `purecas.db` SQLite file. That model is being
+replaced by the filesystem-first model documented above. The two models
+are **not interoperable in the same root**:
 
-purecas is also a library crate. Add to your `Cargo.toml`:
+- `pcas index` refuses to run against a root containing a top-level
+  `purecas.db` (see [`pcas index`](#pcas-index) above), because a legacy
+  command can rewrite that database in place after it has been hard-linked
+  as ordinary content, silently corrupting an entry served under an
+  immutable digest identity.
+- Legacy commands (below) know nothing about `.pcas`, hierarchy
+  organization, or digest HTTP routes.
 
-```toml
-[dependencies]
-purecas = { path = "purecas" }
-```
+**Use a separate root for legacy commands until each surface below has an
+adapt-or-remove follow-up completed and, if you have an existing legacy
+store, until a migration tool ([#16](https://github.com/Hong-Xiang/purecas/issues/16))
+has moved it into a filesystem-first root.**
 
-```rust
-use purecas::Store;
+| Legacy surface | Current behavior | Follow-up |
+|---|---|---|
+| `pcas add-path`, `pcas add-url` (incl. `--unzip`) | Copies into `<root>/sha256/<first2>/<hash>` and registers the file in `purecas.db` | [#20](https://github.com/Hong-Xiang/purecas/issues/20) |
+| `pcas pkg`, `pcas tag`, `pcas meta`, `pcas rel`, `pcas export`, `pcas import` | Package membership, logical paths, tags, metadata, and relations are authoritative only in `purecas.db` | [#19](https://github.com/Hong-Xiang/purecas/issues/19) |
+| `pcas lfs-agent` (Git LFS custom transfer agent) | Stores into legacy `sha256/<prefix>/<hash>` and best-effort registers in `purecas.db` | [#18](https://github.com/Hong-Xiang/purecas/issues/18) |
+| Rust `purecas::Store`/`Blob`/`Package` library API | Entirely SQLite-backed; no awareness of `.pcas` or the visible hierarchy | [#17](https://github.com/Hong-Xiang/purecas/issues/17) |
+| Python `purecas` extension (`purecas-python`) | A wrapper over the legacy Rust `Store` API above | [#17](https://github.com/Hong-Xiang/purecas/issues/17) |
+| Migrating an existing legacy store | No tool yet; do not hand-migrate by mixing layouts in one root | [#16](https://github.com/Hong-Xiang/purecas/issues/16) |
 
-let store = Store::open("/path/to/cas")?;
+These commands and APIs remain available as legacy behavior on this
+branch, but they do not interoperate with filesystem-first path/digest
+serving, and no permanent dual-layout compatibility is planned. See the
+[design issue](https://github.com/Hong-Xiang/purecas/issues/2) for the
+full architectural rationale and breaking-transition rules.
 
-// Add a file
-let blob = store.add_path("data/file.bin")?;
-println!("Stored: {}", blob.hash());
+### Git LFS integration (legacy)
 
-// Metadata
-blob.add_tags(&["train", "v2"])?;
-blob.set_metadata("epoch=10")?;
-
-// Packages
-let pkg = store.create_package("my-dataset", Some("training data"))?;
-pkg.add_blob(&blob, Some("images/001.png"))?;
-pkg.export("/tmp/export")?;
-```
-
-## Python Usage
-
-Install with maturin:
-
-```bash
-cd purecas-python
-maturin develop
-```
-
-```python
-import purecas
-
-store = purecas.Store.open("/path/to/cas")
-blob = store.add_path("/data/file.bin")
-print(blob.hash, blob.path)
-
-blob.add_tags(["train", "v2"])
-blob.set_metadata("epoch=10")
-
-pkg = store.create_package("my-dataset")
-pkg.add_blob(blob, path="images/001.png")
-pkg.export("/tmp/export")
-```
-
-## Design Decisions
-
-- **SHA-256 only** -- no multi-algorithm complexity, consistent with nix conventions.
-- **Read-only blobs (0o444)** -- prevents accidental modification of stored content.
-- **SQLite metadata** -- lightweight, embedded, no external dependencies. Tracks filenames and package membership.
-- **Filesystem is the source of truth for content** -- the DB tracks metadata. `pcas path` and `pcas cat` work without a DB, only needing the blob files.
-- **No built-in transport** -- export/import produces/consumes directories. Use rsync, scp, or any tool for transfer. Git LFS integration is available for version-controlled workflows.
-- **`pcas serve` on axum/Tokio** -- the visible-hierarchy and digest HTTP routes (see above) use current stable `axum`/Tokio, already present transitively through `reqwest`; every file or resolved digest is opened exactly once and representation metadata/body bytes both come from that same descriptor, so `tower-http`'s path-only `ServeFile`/`ServeDir` (which would reopen a path after deriving metadata) are deliberately not used. The async runtime is entered only for this command. Byte-range parsing is a small hand-written grammar rather than `headers::Range::satisfiable_ranges` or `http-range-header`: both were evaluated and found to reject or mishandle required cases (clamping, coalescing overlapping ranges, a suffix range longer than the representation, distinguishing malformed syntax from an unsatisfiable set).
-- **No garbage collection (yet)** -- planned for a future release.
-
-## Git LFS Integration
-
-`pcas` can act as a [Git LFS custom transfer agent](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md), allowing Git LFS to store large files in your purecas CAS instead of a remote server.
-
-### Setup
-
-Add to your repo's `.git/config` (or global `~/.gitconfig`):
+`pcas` can act as a
+[Git LFS custom transfer agent](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md),
+storing large files pushed/pulled through Git LFS in a legacy purecas
+root instead of a remote server. Add to your repo's `.git/config` (or
+global `~/.gitconfig`):
 
 ```gitconfig
 [lfs "customtransfer.pcas"]
@@ -399,27 +404,45 @@ Add to your repo's `.git/config` (or global `~/.gitconfig`):
     standalonetransferagent = pcas
 ```
 
-If your CAS root isn't the default (`~/data/blob`), pass it via args:
+Pass a non-default root via `args = "--root /path/to/cas lfs-agent"` or
+the `CAS_ROOT` environment variable. This root is a legacy `sha256/` +
+`purecas.db` root today (see [#18](https://github.com/Hong-Xiang/purecas/issues/18))
+and must not be the same root you run `pcas index`/`pcas serve` against.
 
-```gitconfig
-[lfs "customtransfer.pcas"]
-    path = pcas
-    args = "--root /path/to/cas lfs-agent"
-```
-
-Or set the `CAS_ROOT` environment variable.
-
-### How it works
-
-When you `git push` or `git pull`, Git LFS spawns `pcas lfs-agent` and communicates via a JSON protocol over stdin/stdout:
-
-- **Upload (`git push`):** Stores the blob in the CAS (`sha256/<prefix>/<hash>`), verifies the hash matches the LFS OID, and registers it in the metadata DB. Progress is reported during the transfer.
-- **Download (`git pull`):** Returns the CAS path for the blob, which Git LFS reads directly.
-
-### Manual testing
+## Development
 
 ```bash
-echo '{"event":"init","operation":"upload","remote":"origin","concurrent":false}' \
-  | pcas lfs-agent
-# → {"event":"init"}
+nix develop                                        # enter dev shell
+cargo build                                         # build
+cargo test --workspace --exclude purecas-python     # run tests
+cargo clippy --workspace --exclude purecas-python --all-targets -- -D warnings   # lint
+cargo fmt --all                                     # format
+nix build .#pcas                                    # nix build
 ```
+
+## Design Decisions
+
+- **SHA-256 only** — no multi-algorithm complexity, consistent with Nix
+  conventions.
+- **Hard links, not copies** — `.pcas` object entries share an inode with
+  the visible file(s) they were indexed from, so indexing never
+  duplicates data on disk.
+- **No authoritative database** — the filesystem is the complete source
+  of truth for both content and organization; `.pcas` is disposable,
+  rebuildable state, not a required component for correctness.
+- **`pcas serve` on axum/Tokio** — the hierarchy and digest HTTP routes
+  use current stable `axum`/Tokio, already present transitively through
+  `reqwest`. Every file or resolved digest is opened exactly once, and
+  representation metadata/body bytes both come from that same
+  descriptor, so `tower-http`'s path-only `ServeFile`/`ServeDir` (which
+  would reopen a path after deriving metadata) are deliberately not used.
+  The async runtime is entered only for this command. Byte-range parsing
+  is a small hand-written grammar rather than
+  `headers::Range::satisfiable_ranges` or `http-range-header`: both were
+  evaluated and found to reject or mishandle required cases (clamping,
+  coalescing overlapping ranges, a suffix range longer than the
+  representation, distinguishing malformed syntax from an unsatisfiable
+  set).
+- **No garbage collection beyond pruning (yet)** — `pcas index` prunes
+  object entries with no remaining hard link; broader garbage collection
+  across arbitrary retention policies is not yet implemented.
