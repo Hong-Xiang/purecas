@@ -18,8 +18,8 @@ use std::fmt;
 /// A parsed, validated visible request path.
 ///
 /// Each element of `segments` is one `/`-delimited path segment, decoded
-/// exactly once into raw bytes (never containing NUL or `/`). `pcas` is
-/// rejected as the top-level segment before it reaches this type.
+/// exactly once into raw bytes (never containing NUL or `/`). `pcas` and
+/// `.pcas` are rejected as top-level segments before they reach this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisiblePath {
     pub segments: Vec<Vec<u8>>,
@@ -39,7 +39,8 @@ pub enum PathError {
     /// decoded bytes contain `/` (which must never be reinterpreted as an
     /// additional path separator).
     Invalid,
-    /// The top-level segment is `pcas`, reserved for the digest route.
+    /// The top-level segment is `pcas` (reserved for the digest route) or
+    /// `.pcas` (reserved for internal state).
     ReservedTopLevel,
     /// The whole path is the top-level legacy `purecas.db`, which must
     /// never be exposed even if it exists on disk.
@@ -135,7 +136,10 @@ pub fn parse(raw_uri_path: &str) -> Result<VisiblePath, PathError> {
         segments.push(decoded);
     }
 
-    if segments.first().map(Vec::as_slice) == Some(b"pcas".as_slice()) {
+    if matches!(
+        segments.first().map(Vec::as_slice),
+        Some(b"pcas") | Some(b".pcas")
+    ) {
         return Err(PathError::ReservedTopLevel);
     }
     if segments.len() == 1 && segments[0] == b"purecas.db" {
@@ -228,9 +232,28 @@ mod tests {
     }
 
     #[test]
+    fn reserved_top_level_dot_pcas() {
+        assert_eq!(parse("/.pcas"), Err(PathError::ReservedTopLevel));
+        assert_eq!(
+            parse("/.pcas/sha256/object"),
+            Err(PathError::ReservedTopLevel)
+        );
+        assert_eq!(
+            parse("/%2epcas/index.lock"),
+            Err(PathError::ReservedTopLevel)
+        );
+    }
+
+    #[test]
     fn nested_pcas_is_not_reserved() {
         let p = parse("/foo/pcas/bar").unwrap();
         assert_eq!(p.segments, segs(&[b"foo", b"pcas", b"bar"]));
+    }
+
+    #[test]
+    fn nested_dot_pcas_is_not_reserved() {
+        let p = parse("/foo/.pcas/bar").unwrap();
+        assert_eq!(p.segments, segs(&[b"foo", b".pcas", b"bar"]));
     }
 
     #[test]

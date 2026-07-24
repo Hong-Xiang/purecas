@@ -639,6 +639,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dot_pcas_created_after_router_start_remains_hidden() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"indexed later").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join(".pcas/index.lock"),
+            dir.path().join("late-internal"),
+        )
+        .unwrap();
+        let app = make_router(dir.path());
+
+        let report = crate::index::index_root(dir.path(), None, false).unwrap();
+        let digest = report.created[0].digest.as_str();
+
+        assert_eq!(
+            get(app.clone(), "/.pcas/index.lock").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(app.clone(), "/late-internal").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let digest_response = get(app, &format!("/pcas/{digest}")).await;
+        assert_eq!(digest_response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(digest_response).await, b"indexed later");
+    }
+
+    #[tokio::test]
     async fn symlink_outside_root_is_404() {
         let dir = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
