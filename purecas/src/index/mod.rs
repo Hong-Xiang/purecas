@@ -451,6 +451,21 @@ mod tests {
     }
 
     #[test]
+    fn index_includes_nested_user_directory_named_dot_pcas() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "visible/.pcas/data.bin", b"nested visible content");
+
+        let report = index_root(root, None, false).unwrap();
+
+        assert_eq!(report.summary.indexed, 1);
+        assert_eq!(
+            report.created[0].relative_path.as_path(),
+            Path::new("visible/.pcas/data.bin")
+        );
+    }
+
+    #[test]
     fn index_never_follows_symlinks() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
