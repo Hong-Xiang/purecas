@@ -164,7 +164,7 @@ async fn respond_directory(
     {
         let name = entry.file_name();
         let name_bytes = name.as_bytes();
-        if name_bytes == b".pcas" {
+        if canonical_dir == state.root.canonical_root() && name_bytes == b".pcas" {
             continue;
         }
         if canonical_dir == state.root.canonical_root() && name_bytes == b"purecas.db" {
@@ -663,6 +663,22 @@ mod tests {
         let digest_response = get(app, &format!("/pcas/{digest}")).await;
         assert_eq!(digest_response.status(), StatusCode::OK);
         assert_eq!(body_bytes(digest_response).await, b"indexed later");
+    }
+
+    #[tokio::test]
+    async fn nested_dot_pcas_is_visible_in_directory_listing() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("visible/.pcas")).unwrap();
+        std::fs::write(dir.path().join("visible/.pcas/data.txt"), b"visible").unwrap();
+
+        let listing = get(make_router(dir.path()), "/visible/").await;
+        assert_eq!(listing.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(listing).await).unwrap();
+        assert!(html.contains("href=\".pcas/\">.pcas/</a>"), "{html}");
+
+        let file = get(make_router(dir.path()), "/visible/.pcas/data.txt").await;
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(body_bytes(file).await, b"visible");
     }
 
     #[tokio::test]
