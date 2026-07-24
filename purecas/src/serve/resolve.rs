@@ -1,4 +1,5 @@
-//! Canonical root/`.pcas` boundaries and safe per-request path resolution.
+//! Canonical root and internal `.pcas` boundaries with safe per-request
+//! path resolution.
 //!
 //! Every visible target is canonicalized and checked for containment
 //! *before* it is opened. A regular file is then opened exactly once, and
@@ -12,11 +13,11 @@ use anyhow::{Context, Result};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// The canonicalized `PCAS_ROOT` and (if it exists) its internal `.pcas`
-/// directory, established once at server startup.
+/// The canonicalized `PCAS_ROOT` and its component-aware internal `.pcas`
+/// boundary. The boundary exists lexically even before the first index.
 pub struct Root {
     canonical_root: PathBuf,
-    canonical_pcas: Option<PathBuf>,
+    pcas_path: PathBuf,
 }
 
 impl Root {
@@ -33,13 +34,10 @@ impl Root {
             "PCAS_ROOT {} is not a directory",
             canonical_root.display()
         );
-        // `.pcas` may not have been created yet (e.g. before the first
-        // `pcas index`); that is not an error, it just means no target can
-        // resolve into it.
-        let canonical_pcas = std::fs::canonicalize(canonical_root.join(".pcas")).ok();
+        let pcas_path = canonical_root.join(".pcas");
         Ok(Self {
             canonical_root,
-            canonical_pcas,
+            pcas_path,
         })
     }
 
@@ -96,10 +94,8 @@ async fn finalize(root: &Root, candidate: PathBuf) -> Result<Resolved> {
     if !canonical.starts_with(&root.canonical_root) {
         return Ok(Resolved::NotFound);
     }
-    if let Some(pcas) = &root.canonical_pcas {
-        if canonical.starts_with(pcas) {
-            return Ok(Resolved::NotFound);
-        }
+    if canonical.starts_with(&root.pcas_path) {
+        return Ok(Resolved::NotFound);
     }
 
     let kind = match tokio::fs::metadata(&canonical).await {

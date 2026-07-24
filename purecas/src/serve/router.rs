@@ -164,7 +164,7 @@ async fn respond_directory(
     {
         let name = entry.file_name();
         let name_bytes = name.as_bytes();
-        if name_bytes == b".pcas" {
+        if canonical_dir == state.root.canonical_root() && name_bytes == b".pcas" {
             continue;
         }
         if canonical_dir == state.root.canonical_root() && name_bytes == b"purecas.db" {
@@ -636,6 +636,49 @@ mod tests {
             get(make_router(dir.path()), "/link/secret").await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn dot_pcas_created_after_router_start_remains_hidden() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"indexed later").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join(".pcas/index.lock"),
+            dir.path().join("late-internal"),
+        )
+        .unwrap();
+        let app = make_router(dir.path());
+
+        let report = crate::index::index_root(dir.path(), None, false).unwrap();
+        let digest = report.created[0].digest.as_str();
+
+        assert_eq!(
+            get(app.clone(), "/.pcas/index.lock").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(app.clone(), "/late-internal").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let digest_response = get(app, &format!("/pcas/{digest}")).await;
+        assert_eq!(digest_response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(digest_response).await, b"indexed later");
+    }
+
+    #[tokio::test]
+    async fn nested_dot_pcas_is_visible_in_directory_listing() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("visible/.pcas")).unwrap();
+        std::fs::write(dir.path().join("visible/.pcas/data.txt"), b"visible").unwrap();
+
+        let listing = get(make_router(dir.path()), "/visible/").await;
+        assert_eq!(listing.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(listing).await).unwrap();
+        assert!(html.contains("href=\".pcas/\">.pcas/</a>"), "{html}");
+
+        let file = get(make_router(dir.path()), "/visible/.pcas/data.txt").await;
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(body_bytes(file).await, b"visible");
     }
 
     #[tokio::test]
