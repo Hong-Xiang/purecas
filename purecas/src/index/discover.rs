@@ -1,0 +1,128 @@
+//! Recursive discovery of visible regular files under `PCAS_ROOT`, with
+//! basename/relative-path pattern matching.
+
+use super::types::RootRelativePath;
+use super::LEGACY_DATABASE_NAME;
+use anyhow::{bail, Context, Result};
+use globset::{Glob, GlobBuilder, GlobMatcher};
+use std::path::{Component, Path, PathBuf};
+use walkdir::WalkDir;
+
+/// A validated selection pattern for `pcas index [PATTERN]`.
+pub enum Pattern {
+    /// No pattern: every visible regular file is selected.
+    All,
+    /// A pattern without `/`: matches basenames recursively.
+    Basename(GlobMatcher),
+    /// A pattern containing `/`: matches root-relative paths.
+    RelativePath(GlobMatcher),
+}
+
+impl Pattern {
+    /// Parse and validate a raw `PATTERN` argument. Rejects absolute and
+    /// parent-escaping patterns.
+    pub fn parse(raw: Option<&str>) -> Result<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::All);
+        };
+        if raw.is_empty() {
+            bail!("pattern must not be empty");
+        }
+        if raw.starts_with('/') {
+            bail!("pattern must not be absolute: {raw:?}");
+        }
+        let escapes = Path::new(raw)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
+        if escapes {
+            bail!("pattern must not contain parent-directory segments: {raw:?}");
+        }
+
+        if raw.contains('/') {
+            Ok(Self::RelativePath(compile(raw)?))
+        } else {
+            Ok(Self::Basename(compile(raw)?))
+        }
+    }
+
+    /// Test a discovered root-relative path against this pattern.
+    pub fn matches(&self, rel: &RootRelativePath) -> bool {
+        match self {
+            Self::All => true,
+            Self::Basename(glob) => rel
+                .as_path()
+                .file_name()
+                .is_some_and(|name| glob.is_match(name)),
+            Self::RelativePath(glob) => glob.is_match(rel.as_path()),
+        }
+    }
+}
+
+fn compile(raw: &str) -> Result<GlobMatcher> {
+    let glob: Glob = GlobBuilder::new(raw)
+        .literal_separator(true)
+        .build()
+        .with_context(|| format!("invalid glob pattern: {raw:?}"))?;
+    Ok(glob.compile_matcher())
+}
+
+/// Recursively discover every visible regular file under `root`.
+///
+/// The top-level internal `.pcas` is pruned before descent; nested user
+/// directories with that name remain visible. Symbolic links are never
+/// followed or treated as regular files; directories, sockets, devices, and
+/// FIFOs are skipped.
+pub fn discover_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() != 1 || entry.file_name() != ".pcas");
+
+    for entry in walker {
+        let entry = entry.with_context(|| format!("walking {}", root.display()))?;
+        if entry.depth() == 1 && entry.file_name() == LEGACY_DATABASE_NAME {
+            bail!(
+                "legacy SQLite store detected at {}; migrate it or use a separate root before running `pcas index`",
+                entry.path().display()
+            );
+        }
+        if entry.path_is_symlink() {
+            continue;
+        }
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn discovery_rejects_top_level_legacy_database() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join(LEGACY_DATABASE_NAME), b"legacy sqlite").unwrap();
+
+        let error = discover_files(root.path()).unwrap_err();
+
+        assert!(error.to_string().contains("legacy SQLite store"));
+    }
+
+    #[test]
+    fn discovery_prunes_only_top_level_dot_pcas() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join(".pcas/sha256")).unwrap();
+        std::fs::write(root.path().join(".pcas/sha256/internal"), b"internal").unwrap();
+        std::fs::create_dir_all(root.path().join("visible/.pcas")).unwrap();
+        let nested = root.path().join("visible/.pcas/data.bin");
+        std::fs::write(&nested, b"visible").unwrap();
+
+        let files = discover_files(root.path()).unwrap();
+
+        assert_eq!(files, vec![nested]);
+    }
+}

@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +44,16 @@ enum Commands {
     Path {
         /// SHA-256 hash
         hash: String,
+    },
+    /// Discover and index visible regular files under the CAS root
+    Index {
+        /// Optional glob pattern; without `/` matches basenames recursively,
+        /// with `/` matches root-relative paths. Omit to index everything.
+        pattern: Option<String>,
+        /// Force full content verification of every matched visible file
+        /// and every retained object entry, bypassing the mtime fast path.
+        #[arg(long)]
+        rehash: bool,
     },
     /// Package operations
     Pkg {
@@ -90,6 +100,12 @@ enum Commands {
     },
     /// Run as a Git LFS custom transfer agent (stdin/stdout protocol)
     LfsAgent,
+    /// Serve the visible hierarchy over read-only HTTP
+    Serve {
+        /// Address to bind (default: 127.0.0.1:8000)
+        #[arg(long, default_value = "127.0.0.1:8000")]
+        bind: std::net::SocketAddr,
+    },
 }
 
 #[derive(Subcommand)]
@@ -138,12 +154,52 @@ fn resolve_root(cli_root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join("data").join("blob"))
 }
 
+fn run_index(root: &Path, pattern: Option<&str>, rehash: bool) -> anyhow::Result<()> {
+    let report = purecas::index::index_root(root, pattern, rehash)?;
+    for indexed in &report.created {
+        println!(
+            "{}  {}  {}",
+            indexed.digest,
+            indexed.relative_path,
+            indexed.object_path.display()
+        );
+    }
+    for failure in &report.failures {
+        eprintln!("{failure}");
+    }
+    println!("{}", report.summary);
+    if report.summary.failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let root = resolve_root(cli.root)?;
+
+    // `index` and `path` operate purely on the packed filesystem object
+    // layout under `.pcas`; they must never open or create `purecas.db`.
+    // `serve` is dispatched here too: it must never open or create
+    // `purecas.db` either, and never exposes it if it already exists.
+    match cli.command {
+        Commands::Index { pattern, rehash } => return run_index(&root, pattern.as_deref(), rehash),
+        Commands::Path { hash } => {
+            let resolved = purecas::index::resolve_digest(&root, &hash)
+                .map_err(purecas::index::DigestResolutionError::into_anyhow)?;
+            println!("{}", resolved.path.display());
+            return Ok(());
+        }
+        Commands::Serve { bind } => return purecas::serve::run_cli(&root, bind),
+        _ => {}
+    }
+
     let store = purecas::Store::open(&root)?;
 
     match cli.command {
+        Commands::Index { .. } | Commands::Path { .. } | Commands::Serve { .. } => {
+            unreachable!("handled above")
+        }
         Commands::AddPath { files, tags, meta } => {
             for file in &files {
                 let blob = store.add_path(file)?;
@@ -189,11 +245,6 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", blob.hash());
                 }
             }
-            Ok(())
-        }
-        Commands::Path { hash } => {
-            let blob = store.blob(&hash);
-            println!("{}", blob.path().display());
             Ok(())
         }
         Commands::Pkg { command } => match command {

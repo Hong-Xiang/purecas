@@ -45,18 +45,19 @@ fn test_add_path_multiple_files() {
 }
 
 #[test]
-fn test_path_prints_only_path() {
+fn test_index_then_path_roundtrip() {
     let root = cas_root();
     let file = root.path().join("test.txt");
     fs::write(&file, b"content").unwrap();
 
-    let output = pcas()
+    let index_output = pcas()
         .args(["--root", root.path().to_str().unwrap()])
-        .args(["add-path", file.to_str().unwrap()])
+        .args(["index"])
         .assert()
         .success();
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let hash = stdout.split_whitespace().next().unwrap();
+    let index_stdout = String::from_utf8(index_output.get_output().stdout.clone()).unwrap();
+    assert!(index_stdout.contains("indexed=1"));
+    let hash = index_stdout.split_whitespace().next().unwrap();
 
     let path_output = pcas()
         .args(["--root", root.path().to_str().unwrap()])
@@ -64,25 +65,284 @@ fn test_path_prints_only_path() {
         .assert()
         .success();
     let path_stdout = String::from_utf8(path_output.get_output().stdout.clone()).unwrap();
-    assert!(!path_stdout.contains("[exists]"));
-    assert!(!path_stdout.contains("[missing]"));
-    assert!(path_stdout.contains(hash));
+    let object_path = path_stdout.trim();
+    assert!(object_path.contains(hash));
+    assert!(std::path::Path::new(object_path).exists());
+
+    let visible_meta = fs::metadata(&file).unwrap();
+    let object_meta = fs::metadata(object_path).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(visible_meta.dev(), object_meta.dev());
+    assert_eq!(visible_meta.ino(), object_meta.ino());
 }
 
 #[test]
-fn test_path_missing_blob() {
+fn test_path_missing_digest_fails() {
     let root = cas_root();
-    let path_output = pcas()
+    pcas()
         .args(["--root", root.path().to_str().unwrap()])
         .args([
             "path",
             "0000000000000000000000000000000000000000000000000000000000000000",
         ])
         .assert()
+        .failure();
+}
+
+#[test]
+fn test_path_malformed_digest_fails() {
+    let root = cas_root();
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["path", "not-a-digest"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hex"));
+}
+
+#[test]
+fn test_path_ambiguous_digest_fails() {
+    let root = cas_root();
+    let digest = "a".repeat(64);
+    let shard = root.path().join(".pcas").join("sha256").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join(format!("{digest}--20260722T130016Z")), b"x").unwrap();
+    fs::write(shard.join(format!("{digest}--20260722T140000Z")), b"x").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["path", &digest])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous"));
+}
+
+#[test]
+fn test_index_and_path_never_create_purecas_db() {
+    let root = cas_root();
+    let file = root.path().join("no-sqlite.txt");
+    fs::write(&file, b"no sqlite here").unwrap();
+
+    let index_output = pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
         .success();
-    let stdout = String::from_utf8(path_output.get_output().stdout.clone()).unwrap();
-    assert!(!stdout.contains("[missing]"));
-    assert!(stdout.contains("0000000000000000000000000000000000000000000000000000000000000000"));
+    let index_stdout = String::from_utf8(index_output.get_output().stdout.clone()).unwrap();
+    let hash = index_stdout.split_whitespace().next().unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["path", hash])
+        .assert()
+        .success();
+
+    assert!(!root.path().join("purecas.db").exists());
+}
+
+#[test]
+fn test_index_rejects_legacy_database_before_creating_dot_pcas() {
+    let root = cas_root();
+    fs::write(root.path().join("visible.bin"), b"visible").unwrap();
+    fs::write(root.path().join("purecas.db"), b"legacy sqlite").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("legacy SQLite store")
+                .and(predicate::str::contains("separate root")),
+        );
+
+    assert!(!root.path().join(".pcas").exists());
+    assert_eq!(
+        fs::read(root.path().join("visible.bin")).unwrap(),
+        b"visible"
+    );
+}
+
+#[test]
+fn test_index_is_idempotent() {
+    let root = cas_root();
+    fs::write(root.path().join("stable.bin"), b"stable content").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=1"));
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=0").and(predicate::str::contains("reused=1")));
+}
+
+#[test]
+fn test_index_deduplicates_identical_content_in_one_run() {
+    let root = cas_root();
+    fs::write(root.path().join("a.bin"), b"same bytes").unwrap();
+    fs::write(root.path().join("b.bin"), b"same bytes").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("indexed=1").and(predicate::str::contains("deduplicated=1")),
+        );
+}
+
+#[test]
+fn test_index_excludes_dot_pcas() {
+    let root = cas_root();
+    fs::write(root.path().join("visible.txt"), b"visible").unwrap();
+    // A pre-existing, well-formed but unreferenced object entry is valid
+    // store state; it must never be treated as a discovered visible file.
+    let digest = "c".repeat(64);
+    let shard = root.path().join(".pcas").join("sha256").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(
+        shard.join(format!("{digest}--20260722T130016Z")),
+        b"stray object bytes",
+    )
+    .unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=1"));
+}
+
+#[test]
+fn test_index_basename_pattern() {
+    let root = cas_root();
+    fs::write(root.path().join("a.mp4"), b"a").unwrap();
+    fs::create_dir_all(root.path().join("nested")).unwrap();
+    fs::write(root.path().join("nested").join("b.mp4"), b"b").unwrap();
+    fs::write(root.path().join("c.txt"), b"c").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index", "*.mp4"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=2"));
+}
+
+#[test]
+fn test_index_relative_path_pattern() {
+    let root = cas_root();
+    fs::create_dir_all(root.path().join("data").join("train")).unwrap();
+    fs::create_dir_all(root.path().join("data").join("test")).unwrap();
+    fs::write(root.path().join("data").join("train").join("a.bin"), b"a").unwrap();
+    fs::write(root.path().join("data").join("test").join("b.bin"), b"b").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index", "data/train/*.bin"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=1").and(predicate::str::contains("train")));
+}
+
+#[test]
+fn test_index_rejects_absolute_pattern() {
+    let root = cas_root();
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index", "/etc/passwd"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_index_rehash_flag_repairs_preserved_mtime_mutation() {
+    use filetime::FileTime;
+
+    let root = cas_root();
+    let file = root.path().join("mutate.bin");
+    fs::write(&file, b"before").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed=1"));
+
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&file).unwrap());
+    fs::write(&file, b"after-mutation-longer").unwrap();
+    filetime::set_file_mtime(&file, original_mtime).unwrap();
+
+    // Without --rehash, the preserved mtime hides the mutation.
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reused=1").and(predicate::str::contains("repaired=0")));
+
+    // --rehash always verifies content and repairs the stale object entry.
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index", "--rehash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repaired=1"));
+
+    let expected_hash = sha256_hex(b"after-mutation-longer");
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["path", &expected_hash])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_index_reports_failures_and_exits_nonzero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = cas_root();
+    let bad = root.path().join("bad.bin");
+    fs::write(&bad, b"unreadable").unwrap();
+    fs::write(root.path().join("good.bin"), b"good content").unwrap();
+
+    let mut perms = fs::metadata(&bad).unwrap().permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&bad, perms).unwrap();
+
+    let output = pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .failure();
+
+    // Restore permissions unconditionally so the TempDir cleans up.
+    let mut restore = fs::metadata(&bad).unwrap().permissions();
+    restore.set_mode(0o644);
+    fs::set_permissions(&bad, restore).unwrap();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("indexed=1"));
+    assert!(stdout.contains("failed=1"));
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("bad.bin"));
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 #[test]
@@ -251,14 +511,11 @@ fn test_export_import_roundtrip() {
         .success()
         .stdout(predicate::str::contains("Imported"));
 
-    let path_output = pcas()
-        .args(["--root", root2.path().to_str().unwrap()])
-        .args(["path", hash])
-        .assert()
-        .success();
-    let path_stdout = String::from_utf8(path_output.get_output().stdout.clone()).unwrap();
-    let blob_path = path_stdout.trim();
-    assert!(std::path::Path::new(blob_path).exists());
+    // `pcas path` now resolves only through the new `.pcas` object index and
+    // is unrelated to the legacy import layout; check the legacy blob path
+    // directly instead.
+    let blob_path = root2.path().join("sha256").join(&hash[..2]).join(hash);
+    assert!(blob_path.exists());
 }
 
 #[test]
@@ -514,4 +771,51 @@ fn test_lfs_agent_download_missing() {
 
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains(r#""error"#));
+}
+
+#[test]
+fn test_serve_binds_and_serves_a_file_over_http_without_touching_purecas_db() {
+    use std::io::{BufRead, Read, Write};
+
+    let root = cas_root();
+    fs::create_dir_all(root.path().join("sub")).unwrap();
+    fs::write(root.path().join("sub/file.txt"), b"served bytes").unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pcas"))
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning `pcas serve`");
+
+    // The server prints its bound ephemeral address to stderr before
+    // accepting connections; `serve` is dispatched before `Store::open`, so
+    // this line appears without ever creating `purecas.db`.
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("reading server startup line");
+    assert!(line.contains("listening on http://"), "{line}");
+    let addr = line.trim().rsplit("http://").next().unwrap().to_string();
+
+    let mut stream = std::net::TcpStream::connect(&addr).expect("connecting to pcas serve");
+    write!(
+        stream,
+        "GET /sub/file.txt HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("served bytes"), "{response}");
+    assert!(
+        !root.path().join("purecas.db").exists(),
+        "serve must never create purecas.db"
+    );
+
+    child.kill().expect("killing server process");
+    child.wait().expect("waiting for server process to exit");
 }
