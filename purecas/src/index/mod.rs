@@ -7,17 +7,18 @@
 //!
 //! `pcas index` is a single reconciliation transaction:
 //!
-//! 1. Acquire an exclusive, non-blocking advisory lock on
+//! 1. Refuse a root containing the legacy top-level `purecas.db`.
+//! 2. Acquire an exclusive, non-blocking advisory lock on
 //!    `.pcas/index.lock` for the whole operation, then clean any stale
 //!    `.pcas/tmp` entries left by an interrupted previous run.
-//! 2. Scan and validate the complete packed object index (Phase 1).
+//! 3. Scan and validate the complete packed object index (Phase 1).
 //!    Malformed names, duplicate digests, conflicting inode claims, and
 //!    non-regular entries abort the run before any mutation.
-//! 3. Walk pattern-matched visible files, reusing, creating, deduplicating,
+//! 4. Walk pattern-matched visible files, reusing, creating, deduplicating,
 //!    or repairing object entries as needed (Phases 2-3). Under
 //!    `--rehash`, every retained object is also verified at least once,
 //!    even one with no matching visible link this run.
-//! 4. Prune every object entry whose fresh hard-link count is one,
+//! 5. Prune every object entry whose fresh hard-link count is one,
 //!    independent of the selection pattern (Phase 4).
 //!
 //! Path-local failures (an unstable file, a failed link, rename, or
@@ -39,7 +40,7 @@ mod prune;
 mod reconcile;
 mod scan;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use discover::{discover_files, Pattern};
 use lock::IndexLock;
 use scan::scan_object_index;
@@ -49,6 +50,8 @@ use std::path::{Path, PathBuf};
 use types::{FileTypeSuffix, ObjectFileName, RootRelativePath, Sha256Digest};
 
 pub use reconcile::{FailureKind, IndexedFile, PathFailure};
+
+const LEGACY_DATABASE_NAME: &str = "purecas.db";
 
 fn sha256_dir(root: &Path) -> PathBuf {
     root.join(".pcas").join("sha256")
@@ -266,10 +269,25 @@ fn clean_stale_tmp(root: &Path) -> Result<()> {
     }
 }
 
+fn reject_legacy_database(root: &Path) -> Result<()> {
+    let database = root.join(LEGACY_DATABASE_NAME);
+    match fs::symlink_metadata(&database) {
+        Ok(_) => bail!(
+            "legacy SQLite store detected at {}; migrate it or use a separate root before running `pcas index`",
+            database.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("checking legacy database {}", database.display()))
+        }
+    }
+}
+
 /// Run `pcas index [PATTERN] [--rehash]`: the single reconciliation
 /// transaction described in the module documentation. Never opens or
 /// creates `purecas.db`. Does not print; callers render the report.
 pub fn index_root(root: &Path, pattern: Option<&str>, rehash: bool) -> Result<IndexReport> {
+    reject_legacy_database(root)?;
     let pattern = Pattern::parse(pattern)?;
 
     // Hold the lock for the entire scan/reconcile/prune transaction so a
@@ -559,6 +577,48 @@ mod tests {
         resolve_digest(root, report.created[0].digest.as_str()).unwrap();
 
         assert!(!root.join("purecas.db").exists());
+    }
+
+    #[test]
+    fn index_rejects_legacy_database_before_creating_internal_state() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "visible.bin", b"visible");
+        fs::write(root.join(LEGACY_DATABASE_NAME), b"legacy sqlite").unwrap();
+
+        let error = index_root(root, None, false).unwrap_err();
+
+        assert!(error.to_string().contains("legacy SQLite store"));
+        assert!(!root.join(".pcas").exists());
+        assert_eq!(fs::read(root.join("visible.bin")).unwrap(), b"visible");
+    }
+
+    #[test]
+    fn index_rejects_legacy_database_symlink() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let target = write(root, "database-target", b"legacy sqlite");
+        std::os::unix::fs::symlink(target, root.join(LEGACY_DATABASE_NAME)).unwrap();
+
+        let error = index_root(root, None, false).unwrap_err();
+
+        assert!(error.to_string().contains("legacy SQLite store"));
+        assert!(!root.join(".pcas").exists());
+    }
+
+    #[test]
+    fn top_level_sha256_directory_without_database_is_visible_content() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "sha256/data.bin", b"ordinary visible content");
+
+        let report = index_root(root, None, false).unwrap();
+
+        assert_eq!(report.summary.indexed, 1);
+        assert_eq!(
+            report.created[0].relative_path.as_path(),
+            Path::new("sha256/data.bin")
+        );
     }
 
     // --- deduplication of visible files --------------------------------

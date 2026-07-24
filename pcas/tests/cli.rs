@@ -141,6 +141,29 @@ fn test_index_and_path_never_create_purecas_db() {
 }
 
 #[test]
+fn test_index_rejects_legacy_database_before_creating_dot_pcas() {
+    let root = cas_root();
+    fs::write(root.path().join("visible.bin"), b"visible").unwrap();
+    fs::write(root.path().join("purecas.db"), b"legacy sqlite").unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["index"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("legacy SQLite store")
+                .and(predicate::str::contains("separate root")),
+        );
+
+    assert!(!root.path().join(".pcas").exists());
+    assert_eq!(
+        fs::read(root.path().join("visible.bin")).unwrap(),
+        b"visible"
+    );
+}
+
+#[test]
 fn test_index_is_idempotent() {
     let root = cas_root();
     fs::write(root.path().join("stable.bin"), b"stable content").unwrap();
