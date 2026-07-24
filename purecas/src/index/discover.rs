@@ -68,15 +68,16 @@ fn compile(raw: &str) -> Result<GlobMatcher> {
 
 /// Recursively discover every visible regular file under `root`.
 ///
-/// `.pcas` is pruned before descent; symbolic links are never followed and
-/// are never themselves treated as regular files; directories, sockets,
-/// devices, and FIFOs are skipped.
+/// The top-level internal `.pcas` is pruned before descent; nested user
+/// directories with that name remain visible. Symbolic links are never
+/// followed or treated as regular files; directories, sockets, devices, and
+/// FIFOs are skipped.
 pub fn discover_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".pcas");
+        .filter_entry(|entry| entry.depth() != 1 || entry.file_name() != ".pcas");
 
     for entry in walker {
         let entry = entry.with_context(|| format!("walking {}", root.display()))?;
@@ -109,5 +110,19 @@ mod tests {
         let error = discover_files(root.path()).unwrap_err();
 
         assert!(error.to_string().contains("legacy SQLite store"));
+    }
+
+    #[test]
+    fn discovery_prunes_only_top_level_dot_pcas() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join(".pcas/sha256")).unwrap();
+        std::fs::write(root.path().join(".pcas/sha256/internal"), b"internal").unwrap();
+        std::fs::create_dir_all(root.path().join("visible/.pcas")).unwrap();
+        let nested = root.path().join("visible/.pcas/data.bin");
+        std::fs::write(&nested, b"visible").unwrap();
+
+        let files = discover_files(root.path()).unwrap();
+
+        assert_eq!(files, vec![nested]);
     }
 }
