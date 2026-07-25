@@ -863,6 +863,8 @@ fn test_serve_help_documents_process_routes_flag() {
 fn test_serve_rejects_invalid_process_config_before_binding() {
     let root = cas_root();
     let config = root.path().join("process-routes.toml");
+    let large = fs::File::create(root.path().join("large.bin")).unwrap();
+    large.set_len(128 * 1024 * 1024).unwrap();
     fs::write(
         &config,
         r#"
@@ -952,4 +954,105 @@ fn test_serve_allow_ingest_uploads_and_indexes_without_sqlite() {
 
     child.kill().expect("killing server process");
     child.wait().expect("waiting for server process to exit");
+}
+
+#[test]
+fn test_second_shutdown_signal_forces_exit_after_group_cleanup() {
+    use rustix::process::{kill_process, Pid, Signal};
+    use std::io::{BufRead, Write};
+    use std::time::{Duration, Instant};
+
+    let root = cas_root();
+    let fixture = root.path().join("process-fixture");
+    let fixture_source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../purecas/tests/fixtures/process_fixture.rs");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    assert!(std::process::Command::new(rustc)
+        .arg(fixture_source)
+        .arg("-O")
+        .arg("-o")
+        .arg(&fixture)
+        .status()
+        .unwrap()
+        .success());
+    let descendant_pid = root.path().join("descendant.pid");
+    let config = root.path().join("process-routes.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[[process_routes]]
+path = "/run"
+executable = {fixture:?}
+args = ["descendant-file", {pid_file:?}]
+request_content_type = "application/octet-stream"
+response_content_type = "application/octet-stream"
+max_request_bytes = 1
+max_concurrency = 1
+timeout_seconds = 30
+"#,
+            fixture = fixture.to_string_lossy(),
+            pid_file = descendant_pid.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pcas"))
+        .args(["--root", root.path().to_str().unwrap()])
+        .args([
+            "serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--process-routes",
+            config.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let addr = line.trim().rsplit("http://").next().unwrap().to_string();
+
+    let mut process_request = std::net::TcpStream::connect(&addr).unwrap();
+    write!(
+        process_request,
+        "POST /run HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let started = Instant::now();
+    while !descendant_pid.exists() {
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let descendant: u32 = fs::read_to_string(&descendant_pid)
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let mut stalled = std::net::TcpStream::connect(&addr).unwrap();
+    write!(
+        stalled,
+        "GET /large.bin HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let server_pid = Pid::from_raw(child.id() as i32).unwrap();
+    kill_process(server_pid, Signal::INT).unwrap();
+    kill_process(server_pid, Signal::TERM).unwrap();
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
+    assert!(!std::path::Path::new("/proc")
+        .join(descendant.to_string())
+        .exists());
 }

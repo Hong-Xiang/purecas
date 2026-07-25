@@ -341,6 +341,14 @@ timeout_seconds = 900
   with `Retry-After: 1`. `timeout_seconds`, oversized/erroring request
   bodies, client disconnect, and response cancellation terminate the child
   process group and reap the direct child.
+- CLI `SIGINT`/`SIGTERM` and custom graceful-shutdown futures cancel every
+  active process route before server exit, killing each process group and
+  reaping its direct child. Linux parent-death signaling is also set on the
+  direct child as a crash fallback. A second CLI `SIGINT`/`SIGTERM` during
+  graceful connection drain kills registered groups, waits up to two seconds
+  for supervisor cleanup, then forces process termination. Catastrophic
+  `SIGKILL`, kernel, or host-loss cleanup of arbitrary grandchildren belongs
+  to the deployment supervisor/cgroup and is outside userspace purecas.
 - Child stdout streams to the response with bounded backpressure while stderr
   is drained into a 64 KiB tail. Headers are withheld until stdout begins or
   the child exits. Early nonzero/no-output exits return `502`; zero/no-output

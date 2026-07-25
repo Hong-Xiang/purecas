@@ -128,6 +128,7 @@ pub async fn bind_and_serve_with_options(
     if options.ingestion == IngestionMode::Allow {
         ingest::cleanup_stale(&root)?;
     }
+    let process_routes = options.process_routes.clone();
     let state = Arc::new(router::AppState::with_options(
         root,
         options.ingestion,
@@ -140,6 +141,12 @@ pub async fn bind_and_serve_with_options(
     let local_addr = listener
         .local_addr()
         .context("reading bound local address")?;
+    let shutdown = async move {
+        shutdown.await;
+        if let Some(routes) = process_routes {
+            routes.cancel();
+        }
+    };
     Ok((local_addr, serve(app, listener, shutdown)))
 }
 
@@ -168,11 +175,104 @@ pub fn run_cli_with_options(root: &Path, bind: SocketAddr, options: ServerOption
         .build()
         .context("building the Tokio runtime")?;
     runtime.block_on(async move {
-        let (local_addr, server) =
-            bind_and_serve_with_options(root, bind, options, std::future::pending()).await?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let signal_routes = options.process_routes.clone();
+        let mut signal_task = tokio::spawn(cli_signal_sequence(shutdown_tx, signal_routes));
+        let (local_addr, server) = bind_and_serve_with_options(root, bind, options, async {
+            let _ = shutdown_rx.await;
+        })
+        .await?;
         eprintln!("pcas serve: listening on http://{local_addr}");
-        server.await
+        tokio::pin!(server);
+        tokio::select! {
+            biased;
+            signal = &mut signal_task => {
+                signal.context("CLI signal task failed")?;
+                std::process::exit(130);
+            }
+            result = &mut server => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    &mut signal_task,
+                )
+                .await
+                {
+                    Ok(signal) => {
+                        signal.context("CLI signal task failed")?;
+                        std::process::exit(130);
+                    }
+                    Err(_) => {
+                        signal_task.abort();
+                        result
+                    }
+                }
+            }
+        }
     })
+}
+
+async fn cli_signal_sequence(
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    process_routes: Option<process::ProcessRoutes>,
+) {
+    #[cfg(unix)]
+    {
+        let mut signals = shutdown_signals();
+        receive_shutdown_signal(&mut signals).await;
+        if let Some(routes) = &process_routes {
+            routes.cancel();
+        }
+        let _ = shutdown_tx.send(());
+        // Keep the same registered streams: a second signal already queued
+        // on the non-winning stream remains observable here.
+        receive_shutdown_signal(&mut signals).await;
+        if let Some(routes) = process_routes {
+            routes.terminate_active_groups().await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        if let Some(routes) = &process_routes {
+            routes.cancel();
+        }
+        let _ = shutdown_tx.send(());
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+type ShutdownSignals = (
+    Option<tokio::signal::unix::Signal>,
+    Option<tokio::signal::unix::Signal>,
+);
+
+#[cfg(unix)]
+fn shutdown_signals() -> ShutdownSignals {
+    (
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok(),
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok(),
+    )
+}
+
+#[cfg(unix)]
+async fn receive_shutdown_signal((interrupt, terminate): &mut ShutdownSignals) {
+    tokio::select! {
+        _ = async {
+            if let Some(signal) = interrupt {
+                signal.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
+            if let Some(signal) = terminate {
+                signal.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+    }
 }
 
 #[cfg(test)]

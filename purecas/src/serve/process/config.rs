@@ -2,15 +2,17 @@ use crate::serve::path::VisiblePath;
 use anyhow::{bail, Context, Result};
 use http::HeaderValue;
 use mime::Mime;
+use rustix::process::{kill_process_group, Pid, Signal};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -260,10 +262,16 @@ pub(crate) struct ProcessRoute {
     max_request_bytes: u64,
     timeout: Duration,
     semaphore: Arc<Semaphore>,
+    shutdown: CancellationToken,
+    active_groups: Arc<Mutex<HashSet<i32>>>,
 }
 
 impl ProcessRoute {
-    fn validate(raw: RawRoute) -> Result<Self> {
+    fn validate(
+        raw: RawRoute,
+        shutdown: CancellationToken,
+        active_groups: Arc<Mutex<HashSet<i32>>>,
+    ) -> Result<Self> {
         let pattern = RoutePattern::parse(&raw.path)
             .with_context(|| format!("validating process route {}", raw.path))?;
         validate_executable(&raw.executable)?;
@@ -354,6 +362,8 @@ impl ProcessRoute {
             max_request_bytes: raw.max_request_bytes,
             timeout: Duration::from_secs(raw.timeout_seconds),
             semaphore: Arc::new(Semaphore::new(raw.max_concurrency)),
+            shutdown,
+            active_groups,
         })
     }
 
@@ -394,6 +404,23 @@ impl ProcessRoute {
     pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<OwnedSemaphorePermit, TryAcquireError> {
         Arc::clone(&self.semaphore).try_acquire_owned()
     }
+
+    pub(crate) async fn cancelled(&self) {
+        self.shutdown.cancelled().await;
+    }
+
+    pub(crate) fn register_group(&self, pid: Pid) {
+        self.active_groups.lock().unwrap().insert(pid.as_raw_pid());
+    }
+
+    pub(crate) fn unregister_group(&self, pid: Pid) {
+        self.active_groups.lock().unwrap().remove(&pid.as_raw_pid());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel(&self) {
+        self.shutdown.cancel();
+    }
 }
 
 fn validate_executable(path: &Path) -> Result<()> {
@@ -423,6 +450,8 @@ fn validate_executable(path: &Path) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct ProcessRoutes {
     routes: Arc<[Arc<ProcessRoute>]>,
+    shutdown: CancellationToken,
+    active_groups: Arc<Mutex<HashSet<i32>>>,
 }
 
 impl ProcessRoutes {
@@ -438,10 +467,14 @@ impl ProcessRoutes {
         if raw.process_routes.is_empty() {
             bail!("process route config must contain at least one [[process_routes]] entry");
         }
+        let shutdown = CancellationToken::new();
+        let active_groups = Arc::new(Mutex::new(HashSet::new()));
         let routes = raw
             .process_routes
             .into_iter()
-            .map(ProcessRoute::validate)
+            .map(|route| {
+                ProcessRoute::validate(route, shutdown.clone(), Arc::clone(&active_groups))
+            })
             .map(|result| result.map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
         for (index, route) in routes.iter().enumerate() {
@@ -457,6 +490,8 @@ impl ProcessRoutes {
         }
         Ok(Self {
             routes: routes.into(),
+            shutdown,
+            active_groups,
         })
     }
 
@@ -478,6 +513,36 @@ impl ProcessRoutes {
             RouteLookup::InvalidCapture
         } else {
             RouteLookup::None
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.shutdown.cancel();
+    }
+
+    pub(crate) async fn terminate_active_groups(&self) {
+        self.cancel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let groups = self
+                .active_groups
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            if groups.is_empty() {
+                return;
+            }
+            for raw in groups {
+                if let Some(pid) = Pid::from_raw(raw) {
+                    let _ = kill_process_group(pid, Signal::KILL);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

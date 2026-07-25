@@ -62,6 +62,7 @@ enum Failure {
     Stdout(io::Error),
     Stderr(io::Error),
     Timeout,
+    Shutdown,
     Internal(String),
 }
 
@@ -80,15 +81,22 @@ struct PumpCompletion {
 
 struct ProcessGuard {
     pid: Pid,
+    route: Arc<ProcessRoute>,
     armed: bool,
 }
 
 impl ProcessGuard {
-    fn new(pid: Pid) -> Self {
-        Self { pid, armed: true }
+    fn new(pid: Pid, route: Arc<ProcessRoute>) -> Self {
+        route.register_group(pid);
+        Self {
+            pid,
+            route,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
+        self.route.unregister_group(self.pid);
         self.armed = false;
     }
 }
@@ -97,6 +105,7 @@ impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if self.armed {
             let _ = kill_process_group(self.pid, Signal::KILL);
+            self.route.unregister_group(self.pid);
         }
     }
 }
@@ -107,6 +116,7 @@ impl Failure {
             Self::Input(InputFailure::TooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Input(InputFailure::Read(_)) => StatusCode::BAD_REQUEST,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::Shutdown => StatusCode::SERVICE_UNAVAILABLE,
             Self::Input(InputFailure::Write(_))
             | Self::Stdout(_)
             | Self::Stderr(_)
@@ -122,6 +132,7 @@ impl Failure {
             Self::Stdout(error) => format!("reading child stdout: {error}"),
             Self::Stderr(error) => format!("reading child stderr: {error}"),
             Self::Timeout => "process route timed out".to_string(),
+            Self::Shutdown => "server is shutting down".to_string(),
             Self::Internal(message) => message.clone(),
         }
     }
@@ -248,7 +259,7 @@ async fn supervise(
         let _ = child.wait().await;
         return;
     };
-    let mut process_guard = ProcessGuard::new(pid);
+    let mut process_guard = ProcessGuard::new(pid, Arc::clone(&route));
     let Some(stdin) = child.stdin.take() else {
         let _ = start_tx.send(Start::Error(
             StatusCode::BAD_GATEWAY,
@@ -298,6 +309,7 @@ async fn supervise(
         tokio::select! {
             biased;
             _ = sleep_until(deadline) => break Some(Failure::Timeout),
+            _ = route.cancelled() => break Some(Failure::Shutdown),
             _ = async {
                 if let Some(sender) = start_tx.as_mut() {
                     sender.closed().await;
@@ -407,6 +419,18 @@ async fn supervise(
                     ).await;
                     drop(body_tx);
                     finish_failure(Failure::Timeout, committed, &mut start_tx, &mut terminal_tx, &stderr_tail).await;
+                    return;
+                }
+                _ = route.cancelled() => {
+                    terminate_tasks_and_reap(
+                        pid,
+                        &mut child,
+                        PumpHandles { stdin: &mut stdin_task, stdout: &mut stdout_task, stderr: &mut stderr_task },
+                        PumpCompletion { stdin: stdin_done, stdout: stdout_done, stderr: stderr_done },
+                        &mut process_guard,
+                    ).await;
+                    drop(body_tx);
+                    finish_failure(Failure::Shutdown, committed, &mut start_tx, &mut terminal_tx, &stderr_tail).await;
                     return;
                 }
                 _ = async {
@@ -1017,6 +1041,27 @@ timeout_seconds = {timeout_seconds}
         let descendant: u32 = pid_text.trim().parse().unwrap();
         drop(body);
 
+        assert_process_gone(descendant).await;
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_kills_process_group_descendant() {
+        let (route, argv) = configured("descendant", 1, 1, 30);
+        let permit = route.try_acquire().unwrap();
+        let response = execute(Arc::clone(&route), argv, Body::empty(), permit).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let frame = body
+            .frame()
+            .await
+            .expect("fixture emitted child pid")
+            .unwrap();
+        let pid_text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        let descendant: u32 = pid_text.trim().parse().unwrap();
+
+        route.cancel();
+
+        assert!(body.collect().await.is_err());
         assert_process_gone(descendant).await;
     }
 }
