@@ -296,6 +296,67 @@ operations coordinate through purecas's index lock.
   `Allow: GET, HEAD, POST`. Exact `/pcas/<digest>` routes remain read-only
   with `Allow: GET, HEAD`.
 
+#### Opt-in process routes
+
+```bash
+pcas --root /data/models serve --process-routes ./process-routes.toml
+```
+
+Process routes are disabled unless an explicit TOML file is supplied. The
+entire file is parsed and validated before the listener binds; one invalid,
+duplicate, ambiguous, or built-in-colliding route aborts startup without
+installing any route.
+
+```toml
+[[process_routes]]
+path = "/decode/{digest:sha256}/{stream:u32}"
+executable = "/nix/store/.../bin/va-video-decode"
+args = [
+  "url",
+  "--origin", "http://127.0.0.1:8000",
+  "--media-id", "{digest}",
+  "--stream-index", "{stream}",
+]
+request_content_type = "application/vnd.apache.arrow.stream"
+response_content_type = "application/vnd.apache.arrow.stream"
+max_request_bytes = 16777216
+max_concurrency = 1
+timeout_seconds = 900
+```
+
+- Patterns contain literal segments and typed whole-segment captures only.
+  S2 supports exactly `sha256` (lowercase 64-hex) and canonical decimal
+  `u32`. Configured patterns must not overlap.
+- Captures substitute only complete argv elements such as `"{digest}"`.
+  Partial interpolation, capture-selected executables/flags/environment,
+  string splitting, shells, and eval are not supported. Literal argv values
+  and the absolute executable are trusted operator configuration.
+- A matching process POST takes precedence over HTTP ingestion. GET/HEAD
+  continue to use hierarchy/digest behavior. A typed-invalid process path is
+  rejected rather than falling through to ingestion.
+- The request `Content-Type` must exactly match the configured MIME type.
+  Request bytes stream to child stdin with bounded memory and a hard
+  `max_request_bytes` limit. Child stdin is closed immediately at request EOF.
+- Per-route concurrency admission is nonblocking. Saturation returns `503`
+  with `Retry-After: 1`. `timeout_seconds`, oversized/erroring request
+  bodies, client disconnect, and response cancellation terminate the child
+  process group and reap the direct child.
+- Child stdout streams to the response with bounded backpressure while stderr
+  is drained into a 64 KiB tail. Headers are withheld until stdout begins or
+  the child exits. Early nonzero/no-output exits return `502`; zero/no-output
+  exits return a clean empty `200`. After stdout commits `200`, a nonzero or
+  signaled exit aborts the body stream instead of producing a clean EOF.
+- purecas treats request/response bytes as opaque. It does not parse Arrow,
+  media, or producer completeness metadata. A VA route supplies trusted
+  static `--origin`; only digest/stream are captures. VA owns `expected_rows`
+  and Arrow completeness semantics.
+
+**Security warning:** process routes provide remote process execution through
+an operator-defined allowlist, but still have no authentication or TLS. Bind
+only to a trusted interface or place the server behind an authenticated TLS
+reverse proxy. HTTP clients are untrusted; configuration, executable, local
+operator, and same-UID filesystem are trusted.
+
 The two routes differ only in identity, cache policy, and MIME hints:
 
 - **Hierarchy route** (`/datasets/train/video-001.mp4`) — a weak `ETag`

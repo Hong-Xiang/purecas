@@ -851,6 +851,49 @@ fn test_serve_help_documents_allow_ingest_flag() {
 }
 
 #[test]
+fn test_serve_help_documents_process_routes_flag() {
+    pcas()
+        .args(["serve", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--process-routes"));
+}
+
+#[test]
+fn test_serve_rejects_invalid_process_config_before_binding() {
+    let root = cas_root();
+    let config = root.path().join("process-routes.toml");
+    fs::write(
+        &config,
+        r#"
+[[process_routes]]
+path = "/run"
+executable = "/definitely/missing/process-route"
+args = []
+request_content_type = "application/octet-stream"
+response_content_type = "application/octet-stream"
+max_request_bytes = 1
+max_concurrency = 1
+timeout_seconds = 1
+"#,
+    )
+    .unwrap();
+
+    pcas()
+        .args(["--root", root.path().to_str().unwrap()])
+        .args([
+            "serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--process-routes",
+            config.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("process route executable"));
+}
+
+#[test]
 fn test_serve_allow_ingest_uploads_and_indexes_without_sqlite() {
     use std::io::{BufRead, Read, Write};
 

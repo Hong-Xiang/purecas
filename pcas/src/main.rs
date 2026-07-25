@@ -108,6 +108,9 @@ enum Commands {
         /// Allow create-only HTTP POST ingestion (no authentication or TLS)
         #[arg(long)]
         allow_ingest: bool,
+        /// Load opt-in POST process routes from this TOML file
+        #[arg(long, value_name = "FILE")]
+        process_routes: Option<PathBuf>,
     },
 }
 
@@ -193,13 +196,22 @@ fn main() -> anyhow::Result<()> {
             println!("{}", resolved.path.display());
             return Ok(());
         }
-        Commands::Serve { bind, allow_ingest } => {
+        Commands::Serve {
+            bind,
+            allow_ingest,
+            process_routes,
+        } => {
             let ingestion = if allow_ingest {
                 purecas::serve::IngestionMode::Allow
             } else {
                 purecas::serve::IngestionMode::ReadOnly
             };
-            return purecas::serve::run_cli_with_ingestion(&root, bind, ingestion);
+            let mut options = purecas::serve::ServerOptions::default().with_ingestion(ingestion);
+            if let Some(config) = process_routes {
+                options = options
+                    .with_process_routes(purecas::serve::process::ProcessRoutes::load(&config)?);
+            }
+            return purecas::serve::run_cli_with_options(&root, bind, options);
         }
         _ => {}
     }
