@@ -6,10 +6,19 @@ pub use config::ProcessRoutes;
 pub(crate) use config::{RouteLookup, RouteMatch};
 
 use axum::extract::Request;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::{StatusCode, Version};
 
 pub(crate) async fn dispatch(matched: RouteMatch, request: Request) -> Response {
+    if request.version() != Version::HTTP_11 {
+        return (
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "Process routes require HTTP/1.1",
+        )
+            .into_response();
+    }
     let (route, argv) = matched.into_parts();
     let content_type_matches = request
         .headers()

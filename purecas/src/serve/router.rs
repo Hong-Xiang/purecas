@@ -1590,6 +1590,24 @@ timeout_seconds = 5
         drop(active);
     }
 
+    #[tokio::test]
+    async fn process_route_rejects_http_1_0_before_spawn() {
+        let dir = TempDir::new().unwrap();
+        let routes = process_routes("/run", &["argv", "never-spawned"], 4, 1);
+        let app = make_process_router(dir.path(), routes, IngestionMode::ReadOnly);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/run")
+            .version(http::Version::HTTP_10)
+            .header("content-type", "application/octet-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::HTTP_VERSION_NOT_SUPPORTED);
+    }
+
     // --- digest route: identity, headers, normalization, errors --------
 
     #[tokio::test]
