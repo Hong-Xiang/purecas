@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -60,6 +61,20 @@ fn main() {
             std::io::stdin().read_to_end(&mut input).unwrap();
         }
         Some("exit") => {}
+        Some("close-stdin-empty") => {
+            unsafe {
+                drop(std::fs::File::from_raw_fd(0));
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+        Some("close-stdin-output") => {
+            unsafe {
+                drop(std::fs::File::from_raw_fd(0));
+            }
+            std::io::stdout().write_all(b"accepted").unwrap();
+            std::io::stdout().flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+        }
         Some("flood-sleep") => {
             std::io::stdout()
                 .write_all(&vec![b'f'; 256 * 1024])

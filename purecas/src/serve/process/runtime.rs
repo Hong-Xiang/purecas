@@ -525,7 +525,8 @@ async fn pump_stdin(
     max_request_bytes: u64,
 ) -> Result<(), InputFailure> {
     let mut received = 0_u64;
-    let mut write_error = None;
+    let mut stdin_closed = false;
+    let mut fatal_write_error = None;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| InputFailure::Read(error.to_string()))?;
@@ -535,17 +536,34 @@ async fn pump_stdin(
         if received > max_request_bytes {
             return Err(InputFailure::TooLarge);
         }
-        if write_error.is_none() {
+        if !stdin_closed && fatal_write_error.is_none() {
             if let Err(error) = stdin.write_all(&chunk).await {
-                write_error = Some(error);
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    stdin_closed = true;
+                } else {
+                    fatal_write_error = Some(error);
+                }
             }
         }
     }
-    if let Some(error) = write_error {
+    if let Some(error) = fatal_write_error {
         return Err(InputFailure::Write(error));
     }
-    stdin.flush().await.map_err(InputFailure::Write)?;
-    stdin.shutdown().await.map_err(InputFailure::Write)
+    if stdin_closed {
+        return Ok(());
+    }
+    if let Err(error) = stdin.flush().await {
+        return if error.kind() == io::ErrorKind::BrokenPipe {
+            Ok(())
+        } else {
+            Err(InputFailure::Write(error))
+        };
+    }
+    match stdin.shutdown().await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(InputFailure::Write(error)),
+    }
 }
 
 async fn pump_stdout(
@@ -777,6 +795,56 @@ timeout_seconds = {timeout_seconds}
             }
         }));
         let response = run("exit", body, 5, 5).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn zero_exit_with_closed_stdin_accepts_in_bounds_body() {
+        let body = Body::from_stream(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))
+        }));
+        let response = run("close-stdin-empty", body, 5, 5).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_output_survives_benign_stdin_epipe() {
+        let body = Body::from_stream(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"leftover"))
+        }));
+        let response = run("close-stdin-output", body, 8, 5).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            b"accepted".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_stdin_still_enforces_delayed_size_overflow() {
+        let body = Body::from_stream(futures_util::stream::unfold(0, |state| async move {
+            match state {
+                0 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Some((Ok::<_, std::io::Error>(Bytes::from_static(b"abc")), 1))
+                }
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Some((Ok::<_, std::io::Error>(Bytes::from_static(b"def")), 2))
+                }
+                _ => None,
+            }
+        }));
+        let response = run("close-stdin-empty", body, 5, 5).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
