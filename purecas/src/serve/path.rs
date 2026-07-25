@@ -13,7 +13,14 @@
 //! percent-encoded, unnormalized wire form, unlike axum's decoded `Path`
 //! extractor, which must never be used for the visible hierarchy.
 
+use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use std::fmt;
+
+const URI_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// A parsed, validated visible request path.
 ///
@@ -25,6 +32,19 @@ pub struct VisiblePath {
     pub segments: Vec<Vec<u8>>,
     /// Whether the raw URI path ended in `/` (including the root path `/`).
     pub trailing_slash: bool,
+}
+
+impl VisiblePath {
+    /// Losslessly encode this parsed path into its canonical hierarchy URL.
+    pub fn encoded_path(&self) -> String {
+        let encoded = self
+            .segments
+            .iter()
+            .map(|segment| percent_encode(segment, URI_SEGMENT).to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("/{encoded}")
+    }
 }
 
 /// Why a raw request path was rejected.
@@ -186,6 +206,12 @@ mod tests {
         let p = parse("/a%20b/%e4%bd%a0").unwrap();
         assert_eq!(p.segments[0], b"a b");
         assert_eq!(p.segments[1], "你".as_bytes());
+    }
+
+    #[test]
+    fn canonical_encoding_escapes_every_non_unreserved_byte() {
+        let p = parse("/a%5cb%5ec/%ff").unwrap();
+        assert_eq!(p.encoded_path(), "/a%5Cb%5Ec/%FF");
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod resolve;
 pub mod router;
 
 mod digest;
+mod ingest;
 mod range;
 mod respond;
 
@@ -43,6 +44,12 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestionMode {
+    ReadOnly,
+    Allow,
+}
 
 /// Serve `router` on an already-bound listener until `shutdown` resolves.
 pub async fn serve(
@@ -65,8 +72,20 @@ pub async fn bind_and_serve(
     bind: SocketAddr,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(SocketAddr, impl Future<Output = Result<()>>)> {
+    bind_and_serve_with_ingestion(root, bind, IngestionMode::ReadOnly, shutdown).await
+}
+
+pub async fn bind_and_serve_with_ingestion(
+    root: &Path,
+    bind: SocketAddr,
+    ingestion: IngestionMode,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(SocketAddr, impl Future<Output = Result<()>>)> {
     let root = resolve::Root::open(root)?;
-    let state = Arc::new(router::AppState::new(root));
+    if ingestion == IngestionMode::Allow {
+        ingest::cleanup_stale(&root)?;
+    }
+    let state = Arc::new(router::AppState::with_ingestion(root, ingestion));
     let app = router::router(state);
     let listener = TcpListener::bind(bind)
         .await
@@ -81,12 +100,21 @@ pub async fn bind_and_serve(
 /// Tokio runtime and blocks on it: this is the only place `pcas` enters an
 /// async runtime.
 pub fn run_cli(root: &Path, bind: SocketAddr) -> Result<()> {
+    run_cli_with_ingestion(root, bind, IngestionMode::ReadOnly)
+}
+
+pub fn run_cli_with_ingestion(
+    root: &Path,
+    bind: SocketAddr,
+    ingestion: IngestionMode,
+) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
         .context("building the Tokio runtime")?;
     runtime.block_on(async move {
-        let (local_addr, server) = bind_and_serve(root, bind, std::future::pending()).await?;
+        let (local_addr, server) =
+            bind_and_serve_with_ingestion(root, bind, ingestion, std::future::pending()).await?;
         eprintln!("pcas serve: listening on http://{local_addr}");
         server.await
     })

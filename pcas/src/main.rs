@@ -100,11 +100,14 @@ enum Commands {
     },
     /// Run as a Git LFS custom transfer agent (stdin/stdout protocol)
     LfsAgent,
-    /// Serve the visible hierarchy over read-only HTTP
+    /// Serve the visible hierarchy over HTTP
     Serve {
         /// Address to bind (default: 127.0.0.1:8000)
         #[arg(long, default_value = "127.0.0.1:8000")]
         bind: std::net::SocketAddr,
+        /// Allow create-only HTTP POST ingestion (no authentication or TLS)
+        #[arg(long)]
+        allow_ingest: bool,
     },
 }
 
@@ -190,7 +193,14 @@ fn main() -> anyhow::Result<()> {
             println!("{}", resolved.path.display());
             return Ok(());
         }
-        Commands::Serve { bind } => return purecas::serve::run_cli(&root, bind),
+        Commands::Serve { bind, allow_ingest } => {
+            let ingestion = if allow_ingest {
+                purecas::serve::IngestionMode::Allow
+            } else {
+                purecas::serve::IngestionMode::ReadOnly
+            };
+            return purecas::serve::run_cli_with_ingestion(&root, bind, ingestion);
+        }
         _ => {}
     }
 
