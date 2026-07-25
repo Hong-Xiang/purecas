@@ -42,23 +42,37 @@ mod scan;
 
 use anyhow::{anyhow, bail, Context, Result};
 use discover::{discover_files, Pattern};
-use lock::IndexLock;
-use scan::scan_object_index;
+use lock::{IndexLock, IndexLockError};
+use rustix::fd::OwnedFd;
+use rustix::fs::{
+    fstat, linkat, mkdirat, openat, openat2, renameat_with, statat, unlinkat, AtFlags, FileType,
+    Mode, OFlags, RenameFlags, ResolveFlags,
+};
+use scan::{scan_object_index, scan_object_index_fd};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
-use types::{FileTypeSuffix, ObjectFileName, RootRelativePath, Sha256Digest};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use types::{FileSnapshot, FileTypeSuffix, ObjectFileName, RootRelativePath, Sha256Digest};
 
 pub use reconcile::{FailureKind, IndexedFile, PathFailure};
 
 const LEGACY_DATABASE_NAME: &str = "purecas.db";
 
+fn internal_root(root: &Path) -> PathBuf {
+    root.join(".pcas")
+}
+
+#[cfg(test)]
 fn sha256_dir(root: &Path) -> PathBuf {
-    root.join(".pcas").join("sha256")
+    scan::sha256_dir(&internal_root(root))
 }
 
 fn shard_dir(root: &Path, digest: &Sha256Digest) -> PathBuf {
-    sha256_dir(root).join(digest.shard())
+    scan::shard_dir(&internal_root(root), digest)
 }
 
 /// Why resolving a digest against the packed object index failed.
@@ -257,11 +271,264 @@ pub struct IndexReport {
     pub summary: IndexSummary,
 }
 
+/// Why indexing one exact visible file failed.
+#[derive(Debug)]
+pub enum IndexFileError {
+    /// Another filesystem-first indexing transaction holds the advisory
+    /// lock. The visible file has not been changed by this call.
+    LockBusy(anyhow::Error),
+    /// Validation, packed-index scanning, hashing, or reconciliation failed.
+    Failed(anyhow::Error),
+}
+
+impl IndexFileError {
+    pub fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::LockBusy(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
+impl fmt::Display for IndexFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LockBusy(error) | Self::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for IndexFileError {}
+
+pub(crate) struct PendingPaths {
+    source_parent: OwnedFd,
+    source_name: OsString,
+    source_lock_name: OsString,
+    _source_lock: std::fs::File,
+    destination_parent: OwnedFd,
+    destination_name: OsString,
+}
+
+impl PendingPaths {
+    pub(crate) fn new(
+        source_parent: OwnedFd,
+        source_name: OsString,
+        source_lock_name: OsString,
+        source_lock: std::fs::File,
+        destination_parent: OwnedFd,
+        destination_name: OsString,
+    ) -> Self {
+        Self {
+            source_parent,
+            source_name,
+            source_lock_name,
+            _source_lock: source_lock,
+            destination_parent,
+            destination_name,
+        }
+    }
+}
+
+/// A synced temporary upload that can become visible only after its exact
+/// canonical object has been reconciled under the index lock.
+pub struct PendingFile {
+    root: OwnedFd,
+    internal_root: OwnedFd,
+    paths: PendingPaths,
+    relative_path: RootRelativePath,
+    display_root: PathBuf,
+    content: PendingContent,
+    _file: std::fs::File,
+    state: PendingState,
+}
+
+#[derive(Clone, Copy)]
+enum PendingState {
+    Source(FileSnapshot),
+    Published(FileSnapshot),
+    Quarantined,
+    Done,
+}
+
+pub(crate) struct PendingContent {
+    snapshot: FileSnapshot,
+    digest: Sha256Digest,
+}
+
+impl PendingContent {
+    pub(crate) fn new(snapshot: FileSnapshot, digest: Sha256Digest) -> Self {
+        Self { snapshot, digest }
+    }
+}
+
+impl PendingFile {
+    pub(crate) fn new(
+        root: OwnedFd,
+        internal_root: OwnedFd,
+        paths: PendingPaths,
+        relative_path: RootRelativePath,
+        display_root: PathBuf,
+        file: std::fs::File,
+        content: PendingContent,
+    ) -> Self {
+        let snapshot = content.snapshot;
+        Self {
+            root,
+            internal_root,
+            paths,
+            relative_path,
+            display_root,
+            content,
+            _file: file,
+            state: PendingState::Source(snapshot),
+        }
+    }
+
+    fn entry_snapshot(parent: &impl AsFd, name: &OsStr) -> Result<Option<FileSnapshot>> {
+        match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_file() => Ok(Some(FileSnapshot {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                size: stat.st_size as u64,
+                mtime_sec: stat.st_mtime,
+                mtime_nsec: stat.st_mtime_nsec as i64,
+            })),
+            Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(error) => Err(descriptor_anyhow(error, "statting quarantined publication")),
+        }
+    }
+
+    /// Atomically quarantine the destination before deciding whether it is
+    /// safe to delete. Returns whether the upload itself was removed.
+    fn remove_published(&mut self) -> Result<bool> {
+        if let PendingState::Published(expected) = self.state {
+            let quarantine_name = rollback_name();
+            match renameat_with(
+                &self.paths.destination_parent,
+                &self.paths.destination_name,
+                &self.paths.source_parent,
+                &quarantine_name,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => self.state = PendingState::Quarantined,
+                Err(rustix::io::Errno::NOENT) => {
+                    self.state = PendingState::Done;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.state = PendingState::Done;
+                    return Err(descriptor_anyhow(
+                        error,
+                        "quarantining visible publication for rollback",
+                    ));
+                }
+            }
+
+            if Self::entry_snapshot(&self.paths.source_parent, &quarantine_name)?
+                .is_none_or(|actual| actual.inode_key() != expected.inode_key())
+            {
+                match renameat_with(
+                    &self.paths.source_parent,
+                    &quarantine_name,
+                    &self.paths.destination_parent,
+                    &self.paths.destination_name,
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.state = PendingState::Done;
+                        return Err(descriptor_anyhow(
+                            error,
+                            "restoring replaced destination after rollback quarantine",
+                        ));
+                    }
+                }
+                self.state = PendingState::Done;
+                return Ok(false);
+            }
+            unlinkat(
+                &self.paths.source_parent,
+                &quarantine_name,
+                AtFlags::empty(),
+            )
+            .map_err(|error| descriptor_anyhow(error, "deleting quarantined publication"))?;
+            self.state = PendingState::Done;
+        }
+        Ok(true)
+    }
+
+    fn cleanup_source(&self, expected: FileSnapshot) -> Result<()> {
+        let quarantine_name = rollback_name();
+        match renameat_with(
+            &self.paths.source_parent,
+            &self.paths.source_name,
+            &self.paths.source_parent,
+            &quarantine_name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(error) => {
+                return Err(descriptor_anyhow(
+                    error,
+                    "quarantining private upload link for cleanup",
+                ))
+            }
+        }
+        if Self::entry_snapshot(&self.paths.source_parent, &quarantine_name)?
+            .is_some_and(|actual| actual.inode_key() == expected.inode_key())
+        {
+            unlinkat(
+                &self.paths.source_parent,
+                &quarantine_name,
+                AtFlags::empty(),
+            )
+            .map_err(|error| descriptor_anyhow(error, "deleting quarantined private upload link"))
+        } else {
+            renameat_with(
+                &self.paths.source_parent,
+                &quarantine_name,
+                &self.paths.source_parent,
+                &self.paths.source_name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|error| descriptor_anyhow(error, "restoring replaced private upload link"))
+        }
+    }
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        match self.state {
+            PendingState::Source(expected) => {
+                let _ = self.cleanup_source(expected);
+            }
+            PendingState::Published(_) => {
+                let _ = self.remove_published();
+            }
+            PendingState::Quarantined | PendingState::Done => {}
+        }
+        let _ = unlinkat(
+            &self.paths.source_parent,
+            &self.paths.source_lock_name,
+            AtFlags::empty(),
+        );
+    }
+}
+
+#[derive(Debug)]
+pub enum PendingFileError {
+    LockBusy(anyhow::Error),
+    Conflict,
+    Inaccessible,
+    CrossDevice(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
 /// Remove any `.pcas/tmp` entries left by an interrupted previous run.
 /// Called only after the exclusive lock is held, so no concurrent `pcas
 /// index` run can be relying on them.
-fn clean_stale_tmp(root: &Path) -> Result<()> {
-    let tmp_dir = root.join(".pcas").join("tmp");
+fn clean_stale_tmp(internal_root: &Path) -> Result<()> {
+    let tmp_dir = internal_root.join("tmp");
     match fs::remove_dir_all(&tmp_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -289,15 +556,16 @@ fn reject_legacy_database(root: &Path) -> Result<()> {
 pub fn index_root(root: &Path, pattern: Option<&str>, rehash: bool) -> Result<IndexReport> {
     reject_legacy_database(root)?;
     let pattern = Pattern::parse(pattern)?;
+    let internal_root = internal_root(root);
 
     // Hold the lock for the entire scan/reconcile/prune transaction so a
     // concurrent `pcas index` fails clearly instead of racing this one.
-    let _lock = IndexLock::acquire(root)?;
-    clean_stale_tmp(root)?;
+    let _lock = IndexLock::acquire(&internal_root).map_err(IndexLockError::into_anyhow)?;
+    clean_stale_tmp(&internal_root)?;
 
     // Phase 1: validate the complete packed object index before any
     // mutation. Corruption here aborts the whole run.
-    let mut index = scan_object_index(root)?;
+    let mut index = scan_object_index(&internal_root)?;
 
     // Phases 2-3: reconcile every pattern-matched visible file.
     let mut selected = Vec::new();
@@ -307,7 +575,8 @@ pub fn index_root(root: &Path, pattern: Option<&str>, rehash: bool) -> Result<In
             selected.push((rel, path));
         }
     }
-    let mut outcome = reconcile::reconcile(root, &mut index, &selected, rehash);
+    let dirs = reconcile::IndexDirs::for_internal_root(&internal_root);
+    let mut outcome = reconcile::reconcile(&dirs, &mut index, &selected, rehash);
 
     // Phase 4: prune every object entry whose fresh `st_nlink == 1`,
     // independent of the selection pattern.
@@ -329,6 +598,572 @@ pub fn index_root(root: &Path, pattern: Option<&str>, rehash: bool) -> Result<In
     })
 }
 
+fn exact_visible_file(root: &Path, relative_path: &RootRelativePath) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing root {}", root.display()))?;
+    let candidate = canonical_root.join(relative_path.as_path());
+    let metadata = fs::symlink_metadata(&candidate)
+        .with_context(|| format!("statting exact visible file {}", candidate.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "exact index target is not a non-symlink regular file: {}",
+        candidate.display()
+    );
+
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalizing exact visible file {}", candidate.display()))?;
+    anyhow::ensure!(
+        canonical == candidate
+            && canonical.starts_with(&canonical_root)
+            && !canonical.starts_with(canonical_root.join(".pcas")),
+        "exact index target is outside the visible hierarchy: {}",
+        candidate.display()
+    );
+    anyhow::ensure!(
+        relative_path.as_path() != Path::new(LEGACY_DATABASE_NAME),
+        "the top-level legacy database is not a visible index target"
+    );
+    Ok(candidate)
+}
+
+/// Index exactly one typed root-relative visible file under the same
+/// filesystem-first transaction lock as [`index_root`].
+///
+/// This validates the complete packed object index but never discovers,
+/// hashes, reconciles, or prunes any unrelated visible file. It returns the
+/// canonical digest/object representation whether the file created, reused,
+/// or deduplicated an object entry.
+pub fn index_file(
+    root: &Path,
+    relative_path: &RootRelativePath,
+) -> Result<IndexedFile, IndexFileError> {
+    reject_legacy_database(root).map_err(IndexFileError::Failed)?;
+    let path = exact_visible_file(root, relative_path).map_err(IndexFileError::Failed)?;
+    let internal_root = internal_root(root);
+    let (mut indexed, _) = index_exact_paths(&internal_root, &path, relative_path, None)?;
+    let file_name = indexed
+        .object_path
+        .file_name()
+        .context("indexed object path has no filename")
+        .map_err(IndexFileError::Failed)?;
+    indexed.object_path = root
+        .join(".pcas")
+        .join("sha256")
+        .join(indexed.digest.shard())
+        .join(file_name);
+    Ok(indexed)
+}
+
+fn index_exact_paths(
+    internal_root: &Path,
+    path: &Path,
+    relative_path: &RootRelativePath,
+    expected: Option<FileSnapshot>,
+) -> Result<(IndexedFile, FileSnapshot), IndexFileError> {
+    let initial_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("statting exact visible file {}", path.display()))
+        .map_err(IndexFileError::Failed)?;
+    if !initial_metadata.is_file() || initial_metadata.file_type().is_symlink() {
+        return Err(IndexFileError::Failed(anyhow!(
+            "exact index target is not a non-symlink regular file: {}",
+            path.display()
+        )));
+    }
+    if let Some(expected) = expected {
+        let initial = FileSnapshot::from_metadata(&initial_metadata);
+        if initial != expected {
+            return Err(IndexFileError::Failed(anyhow!(
+                "published file identity changed before exact indexing"
+            )));
+        }
+    }
+
+    let _lock = match IndexLock::acquire(internal_root) {
+        Ok(lock) => lock,
+        Err(IndexLockError::Busy(error)) => return Err(IndexFileError::LockBusy(error)),
+        Err(IndexLockError::Failed(error)) => return Err(IndexFileError::Failed(error)),
+    };
+
+    clean_stale_tmp(internal_root).map_err(IndexFileError::Failed)?;
+    let mut index = scan_object_index(internal_root).map_err(IndexFileError::Failed)?;
+    let selected = [(relative_path.clone(), path.to_path_buf())];
+    let dirs = reconcile::IndexDirs::for_internal_root(internal_root);
+    let outcome = reconcile::reconcile(&dirs, &mut index, &selected, false);
+    if let Some(failure) = outcome.failures.into_iter().next() {
+        return Err(IndexFileError::Failed(anyhow!(failure)));
+    }
+
+    // Deduplication replaces the visible inode, so derive the result from a
+    // fresh post-reconcile stat rather than from the create-only report.
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("statting indexed visible file {}", path.display()))
+        .map_err(IndexFileError::Failed)?;
+    let snapshot = FileSnapshot::from_metadata(&metadata);
+    let inode = snapshot.inode_key();
+    let digest = index
+        .get_digest_at_inode(inode)
+        .cloned()
+        .with_context(|| {
+            format!(
+                "indexed inode has no packed object entry: {}",
+                path.display()
+            )
+        })
+        .map_err(IndexFileError::Failed)?;
+    let object_path = index
+        .get_by_digest(&digest)
+        .map(|record| record.path.clone())
+        .with_context(|| format!("indexed digest has no packed object entry: {digest}"))
+        .map_err(IndexFileError::Failed)?;
+
+    Ok((
+        IndexedFile {
+            digest,
+            relative_path: relative_path.clone(),
+            object_path,
+        },
+        snapshot,
+    ))
+}
+
+fn descriptor_path(fd: &impl AsFd) -> PathBuf {
+    PathBuf::from("/proc/self/fd").join(fd.as_fd().as_raw_fd().to_string())
+}
+
+fn descriptor_anyhow(error: rustix::io::Errno, context: &'static str) -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::from_raw_os_error(error.raw_os_error())).context(context)
+}
+
+fn open_or_create_internal_dir(parent: &impl AsFd, name: &str) -> Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    loop {
+        match openat(parent, name, flags, Mode::empty()) {
+            Ok(directory) => return Ok(directory),
+            Err(rustix::io::Errno::NOENT) => match mkdirat(parent, name, Mode::from(0o755)) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(descriptor_anyhow(error, "creating internal directory")),
+            },
+            Err(error) => return Err(descriptor_anyhow(error, "opening internal directory")),
+        }
+    }
+}
+
+fn ensure_pending_root_identity(file: &PendingFile) -> Result<()> {
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+    let visible_internal = openat2(
+        &file.root,
+        ".pcas",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        resolve,
+    )
+    .map_err(|error| descriptor_anyhow(error, "opening configured internal index directory"))?;
+    let visible_stat = fstat(&visible_internal).map_err(|error| {
+        descriptor_anyhow(error, "statting configured internal index directory")
+    })?;
+    let held_stat = fstat(&file.internal_root)
+        .map_err(|error| descriptor_anyhow(error, "statting held internal index directory"))?;
+    if visible_stat.st_dev != held_stat.st_dev || visible_stat.st_ino != held_stat.st_ino {
+        bail!("top-level .pcas changed during ingestion");
+    }
+
+    let displayed =
+        fs::metadata(&file.display_root).context("statting configured root pathname")?;
+    let displayed = FileSnapshot::from_metadata(&displayed);
+    let held_root = fstat(&file.root)
+        .map_err(|error| descriptor_anyhow(error, "statting held root directory"))?;
+    if displayed.dev != held_root.st_dev || displayed.ino != held_root.st_ino {
+        bail!("configured root pathname changed during ingestion");
+    }
+    Ok(())
+}
+
+fn ensure_visible_identity(file: &PendingFile, expected: FileSnapshot) -> Result<()> {
+    let opened = openat2(
+        &file.root,
+        file.relative_path.as_path(),
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|error| descriptor_anyhow(error, "opening published root-relative path"))?;
+    let stat =
+        fstat(&opened).map_err(|error| descriptor_anyhow(error, "statting published file"))?;
+    if stat.st_dev != expected.dev
+        || stat.st_ino != expected.ino
+        || stat.st_size as u64 != expected.size
+        || stat.st_mtime != expected.mtime_sec
+        || stat.st_mtime_nsec != expected.mtime_nsec as u64
+    {
+        bail!("published root-relative path does not identify the indexed upload");
+    }
+    ensure_pending_root_identity(file)
+}
+
+fn same_directory(left: &impl AsFd, right: &impl AsFd) -> Result<bool> {
+    let left = fstat(left).map_err(|error| descriptor_anyhow(error, "statting held directory"))?;
+    let right =
+        fstat(right).map_err(|error| descriptor_anyhow(error, "statting live directory"))?;
+    Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+}
+
+fn ensure_object_reachable(
+    internal_root: &impl AsFd,
+    sha256: &impl AsFd,
+    shard: &impl AsFd,
+    digest: &Sha256Digest,
+    object_name: &OsStr,
+    expected: FileSnapshot,
+) -> Result<()> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let live_sha256 = openat(internal_root, "sha256", flags, Mode::empty())
+        .map_err(|error| descriptor_anyhow(error, "opening live sha256 directory"))?;
+    if !same_directory(sha256, &live_sha256)? {
+        bail!("live sha256 directory changed during ingestion");
+    }
+    let live_shard = openat(&live_sha256, digest.shard(), flags, Mode::empty())
+        .map_err(|error| descriptor_anyhow(error, "opening live digest shard"))?;
+    if !same_directory(shard, &live_shard)? {
+        bail!("live digest shard changed during ingestion");
+    }
+    let object = openat(
+        &live_shard,
+        object_name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| descriptor_anyhow(error, "opening live canonical object"))?;
+    let stat = fstat(&object)
+        .map_err(|error| descriptor_anyhow(error, "statting live canonical object"))?;
+    if stat.st_dev != expected.dev
+        || stat.st_ino != expected.ino
+        || stat.st_size as u64 != expected.size
+        || stat.st_mtime != expected.mtime_sec
+        || stat.st_mtime_nsec != expected.mtime_nsec as u64
+    {
+        bail!("live canonical object does not identify the indexed upload");
+    }
+    Ok(())
+}
+
+struct CreatedEntry {
+    name: OsString,
+    snapshot: FileSnapshot,
+}
+
+struct CreatedObjects {
+    entries: Vec<CreatedEntry>,
+    parent: std::fs::File,
+    quarantine: std::fs::File,
+    committed: bool,
+}
+
+impl CreatedObjects {
+    fn new(parent: &impl AsFd, quarantine: &impl AsFd) -> Result<Self> {
+        let parent = std::fs::File::open(descriptor_path(parent))
+            .context("opening created-object directory")?;
+        let quarantine = std::fs::File::open(descriptor_path(quarantine))
+            .context("opening object rollback quarantine")?;
+        Ok(Self {
+            entries: Vec::new(),
+            parent,
+            quarantine,
+            committed: false,
+        })
+    }
+
+    fn track(&mut self, objects: &[reconcile::CreatedObject]) {
+        self.entries.reserve(objects.len());
+        for object in objects {
+            let name = object
+                .path
+                .file_name()
+                .expect("created object always has a filename")
+                .to_os_string();
+            self.entries.push(CreatedEntry {
+                name,
+                snapshot: object.snapshot,
+            });
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+static ROLLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn rollback_name() -> OsString {
+    let counter = ROLLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    OsString::from(format!("rollback-{:x}-{counter:x}", std::process::id()))
+}
+
+fn stat_entry(parent: &impl AsFd, name: &OsStr) -> Option<FileSnapshot> {
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    FileType::from_raw_mode(stat.st_mode)
+        .is_file()
+        .then_some(FileSnapshot {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            size: stat.st_size as u64,
+            mtime_sec: stat.st_mtime,
+            mtime_nsec: stat.st_mtime_nsec as i64,
+        })
+}
+
+fn rollback_created_entry(parent: &impl AsFd, entry: &CreatedEntry, quarantine: &impl AsFd) {
+    let quarantine_name = rollback_name();
+    if renameat_with(
+        parent,
+        &entry.name,
+        quarantine,
+        &quarantine_name,
+        RenameFlags::NOREPLACE,
+    )
+    .is_err()
+    {
+        return;
+    }
+    if stat_entry(quarantine, &quarantine_name)
+        .is_some_and(|actual| actual.inode_key() == entry.snapshot.inode_key())
+    {
+        let _ = unlinkat(quarantine, &quarantine_name, AtFlags::empty());
+    } else {
+        let _ = renameat_with(
+            quarantine,
+            &quarantine_name,
+            parent,
+            &entry.name,
+            RenameFlags::NOREPLACE,
+        );
+    }
+}
+
+impl Drop for CreatedObjects {
+    fn drop(&mut self) {
+        if !self.committed {
+            for entry in &self.entries {
+                rollback_created_entry(&self.parent, entry, &self.quarantine);
+            }
+        }
+    }
+}
+
+fn destination_is_regular(file: &PendingFile) -> Result<bool> {
+    match statat(
+        &file.paths.destination_parent,
+        &file.paths.destination_name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) => Ok(FileType::from_raw_mode(stat.st_mode).is_file()),
+        Err(error) => Err(descriptor_anyhow(error, "checking raced destination")),
+    }
+}
+
+/// Reconcile one pre-hashed temporary file and publish it atomically while
+/// still holding the global index lock.
+pub fn index_and_publish_pending(
+    mut file: PendingFile,
+    lock_timeout: Duration,
+) -> Result<IndexedFile, PendingFileError> {
+    ensure_pending_root_identity(&file).map_err(PendingFileError::Failed)?;
+    let visible_root = descriptor_path(&file.root);
+    reject_legacy_database(&visible_root).map_err(PendingFileError::Failed)?;
+    let source = descriptor_path(&file.paths.source_parent).join(&file.paths.source_name);
+    let source_snapshot =
+        PendingFile::entry_snapshot(&file.paths.source_parent, &file.paths.source_name)
+            .map_err(PendingFileError::Failed)?
+            .context("synced ingestion temporary file is missing or not regular")
+            .map_err(PendingFileError::Failed)?;
+    if source_snapshot != file.content.snapshot {
+        return Err(PendingFileError::Failed(anyhow!(
+            "ingestion temporary file changed after streaming"
+        )));
+    }
+
+    let _lock = match IndexLock::acquire_at_with_timeout(&file.internal_root, lock_timeout) {
+        Ok(lock) => lock,
+        Err(IndexLockError::Busy(error)) => return Err(PendingFileError::LockBusy(error)),
+        Err(IndexLockError::Failed(error)) => return Err(PendingFileError::Failed(error)),
+    };
+    ensure_pending_root_identity(&file).map_err(PendingFileError::Failed)?;
+    let locked_source =
+        PendingFile::entry_snapshot(&file.paths.source_parent, &file.paths.source_name)
+            .map_err(PendingFileError::Failed)?
+            .context("ingestion temporary file is missing or not regular under index lock")
+            .map_err(PendingFileError::Failed)?;
+    if locked_source != file.content.snapshot {
+        return Err(PendingFileError::Failed(anyhow!(
+            "ingestion temporary file changed while waiting for the index lock"
+        )));
+    }
+
+    let sha256 = open_or_create_internal_dir(&file.internal_root, "sha256")
+        .map_err(PendingFileError::Failed)?;
+    let tmp = open_or_create_internal_dir(&file.internal_root, "tmp")
+        .map_err(PendingFileError::Failed)?;
+    let shard = open_or_create_internal_dir(&sha256, file.content.digest.shard())
+        .map_err(PendingFileError::Failed)?;
+    let dirs = reconcile::IndexDirs::for_pending(
+        descriptor_path(&sha256),
+        descriptor_path(&tmp),
+        file.content.digest.clone(),
+        descriptor_path(&shard),
+        file._file
+            .try_clone()
+            .context("cloning held upload descriptor")
+            .map_err(PendingFileError::Failed)?,
+    );
+    let mut index = scan_object_index_fd(&sha256).map_err(PendingFileError::Failed)?;
+    let mut created_objects =
+        CreatedObjects::new(&shard, &tmp).map_err(PendingFileError::Failed)?;
+    let outcome = reconcile::reconcile_prehashed(
+        &dirs,
+        &mut index,
+        &file.relative_path,
+        &source,
+        &file.content.digest,
+        file.content.snapshot,
+    );
+    created_objects.track(&outcome.created_objects);
+    if let Some(failure) = outcome.failures.into_iter().next() {
+        return if failure.kind == FailureKind::CrossDevice {
+            Err(PendingFileError::CrossDevice(anyhow!(failure)))
+        } else {
+            Err(PendingFileError::Failed(anyhow!(failure)))
+        };
+    }
+    let validated_snapshot = outcome
+        .selected_snapshot
+        .context("reconciliation produced no digest-validated snapshot")
+        .map_err(PendingFileError::Failed)?;
+
+    let final_source = openat(
+        &file.paths.source_parent,
+        &file.paths.source_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| descriptor_anyhow(error, "opening reconciled upload inode"))
+    .map_err(PendingFileError::Failed)?;
+    let final_stat = fstat(&final_source)
+        .map_err(|error| descriptor_anyhow(error, "statting reconciled upload inode"))
+        .map_err(PendingFileError::Failed)?;
+    if !FileType::from_raw_mode(final_stat.st_mode).is_file() {
+        return Err(PendingFileError::Failed(anyhow!(
+            "reconciled upload is not a regular file"
+        )));
+    }
+    let final_snapshot = FileSnapshot {
+        dev: final_stat.st_dev,
+        ino: final_stat.st_ino,
+        size: final_stat.st_size as u64,
+        mtime_sec: final_stat.st_mtime,
+        mtime_nsec: final_stat.st_mtime_nsec as i64,
+    };
+    if final_snapshot != validated_snapshot {
+        return Err(PendingFileError::Failed(anyhow!(
+            "canonical upload changed after digest verification"
+        )));
+    }
+    file.state = PendingState::Source(final_snapshot);
+    let digest = index
+        .get_digest_at_inode(final_snapshot.inode_key())
+        .cloned()
+        .context("reconciled ingestion inode has no packed object entry")
+        .map_err(PendingFileError::Failed)?;
+    if digest != file.content.digest {
+        return Err(PendingFileError::Failed(anyhow!(
+            "indexed digest does not match the streamed upload"
+        )));
+    }
+    let record = index
+        .get_by_digest(&digest)
+        .context("reconciled ingestion digest has no packed object entry")
+        .map_err(PendingFileError::Failed)?;
+    let object_name = record
+        .path
+        .file_name()
+        .with_context(|| {
+            format!(
+                "indexed object path has no filename: {}",
+                record.path.display()
+            )
+        })
+        .map_err(PendingFileError::Failed)?
+        .to_os_string();
+    let object_path = file
+        .display_root
+        .join(".pcas")
+        .join("sha256")
+        .join(digest.shard())
+        .join(&object_name);
+
+    ensure_pending_root_identity(&file).map_err(PendingFileError::Failed)?;
+    let held_final_source = descriptor_path(&final_source);
+    match linkat(
+        rustix::fs::CWD,
+        &held_final_source,
+        &file.paths.destination_parent,
+        &file.paths.destination_name,
+        AtFlags::SYMLINK_FOLLOW,
+    ) {
+        Ok(()) => file.state = PendingState::Published(final_snapshot),
+        Err(rustix::io::Errno::EXIST) => {
+            return match destination_is_regular(&file) {
+                Ok(true) => Err(PendingFileError::Conflict),
+                Ok(false) => Err(PendingFileError::Inaccessible),
+                Err(error) => Err(PendingFileError::Failed(error)),
+            };
+        }
+        Err(rustix::io::Errno::XDEV) => {
+            return Err(PendingFileError::CrossDevice(anyhow!(
+                "temporary and destination filesystems differ"
+            )));
+        }
+        Err(error) => {
+            return Err(PendingFileError::Failed(descriptor_anyhow(
+                error,
+                "atomically publishing indexed upload",
+            )));
+        }
+    }
+    let commit_check = file
+        .cleanup_source(final_snapshot)
+        .and_then(|()| ensure_visible_identity(&file, final_snapshot))
+        .and_then(|()| {
+            ensure_object_reachable(
+                &file.internal_root,
+                &sha256,
+                &shard,
+                &digest,
+                &object_name,
+                final_snapshot,
+            )
+        });
+    if let Err(error) = commit_check {
+        match file.remove_published() {
+            Ok(true) => {}
+            Ok(false) => created_objects.commit(),
+            Err(cleanup) => {
+                created_objects.commit();
+                return Err(PendingFileError::Failed(cleanup.context(format!(
+                    "publication identity check also failed: {error:#}"
+                ))));
+            }
+        }
+        return Err(PendingFileError::Failed(error));
+    }
+    created_objects.commit();
+    file.state = PendingState::Done;
+    Ok(IndexedFile {
+        digest,
+        relative_path: file.relative_path.clone(),
+        object_path,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +1180,119 @@ mod tests {
         }
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn exact_file_index_does_not_discover_or_prune_unrelated_files() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let selected = write(root, "selected.bin", b"selected");
+        let unrelated = write(root, "unrelated.bin", b"unrelated");
+        let relative = RootRelativePath::from_relative(Path::new("selected.bin")).unwrap();
+
+        let indexed = index_file(root, &relative).unwrap();
+
+        assert_eq!(indexed.relative_path, relative);
+        assert!(indexed.object_path.exists());
+        assert_eq!(fs::metadata(selected).unwrap().nlink(), 2);
+        assert_eq!(
+            fs::metadata(unrelated).unwrap().nlink(),
+            1,
+            "the unrelated visible file must not be indexed"
+        );
+        let objects = scan_object_index(&internal_root(root)).unwrap();
+        assert_eq!(objects.records().count(), 1);
+    }
+
+    #[test]
+    fn exact_file_index_returns_existing_canonical_object_after_deduplication() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "first.bin", b"same");
+        index_root(root, None, false).unwrap();
+        write(root, "second.bin", b"same");
+        let relative = RootRelativePath::from_relative(Path::new("second.bin")).unwrap();
+
+        let indexed = index_file(root, &relative).unwrap();
+
+        assert_eq!(
+            indexed.digest.as_str(),
+            crate::store::hash_file(&root.join("second.bin")).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(root.join("second.bin")).unwrap().ino(),
+            fs::metadata(indexed.object_path).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn patterned_recovery_repairs_corrupt_canonical_before_deduplication() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let original = b"original content";
+        write(root, "canonical.bin", original);
+        let first = index_root(root, None, false).unwrap();
+        let digest = first.created[0].digest.clone();
+        fs::write(root.join("canonical.bin"), b"corrupt content!").unwrap();
+        write(root, "recovery.bin", original);
+
+        let recovered = index_root(root, Some("recovery.bin"), false).unwrap();
+
+        assert_eq!(recovered.summary.repaired, 1);
+        assert_eq!(fs::read(root.join("recovery.bin")).unwrap(), original);
+        let object = resolve_digest(root, digest.as_str()).unwrap();
+        assert_eq!(fs::read(object.path).unwrap(), original);
+    }
+
+    #[test]
+    fn patterned_recovery_removes_old_digest_for_mutated_selected_inode() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "canonical.bin", b"digest d");
+        write(root, "selected.bin", b"digest e");
+        let first = index_root(root, None, false).unwrap();
+        let digest_d = first
+            .created
+            .iter()
+            .find(|indexed| indexed.relative_path.as_path() == Path::new("canonical.bin"))
+            .unwrap()
+            .digest
+            .clone();
+        let digest_e = first
+            .created
+            .iter()
+            .find(|indexed| indexed.relative_path.as_path() == Path::new("selected.bin"))
+            .unwrap()
+            .digest
+            .clone();
+        fs::write(root.join("canonical.bin"), b"corrupt!").unwrap();
+        fs::write(root.join("selected.bin"), b"digest d").unwrap();
+
+        let recovered = index_root(root, Some("selected.bin"), true).unwrap();
+
+        assert_eq!(recovered.summary.failed, 0);
+        assert_eq!(
+            fs::read(resolve_digest(root, digest_d.as_str()).unwrap().path).unwrap(),
+            b"digest d"
+        );
+        assert!(matches!(
+            resolve_digest(root, digest_e.as_str()),
+            Err(DigestResolutionError::NotFound(_))
+        ));
+        scan_object_index(&internal_root(root)).unwrap();
+    }
+
+    #[test]
+    fn exact_file_index_classifies_lock_contention() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "selected.bin", b"selected");
+        let relative = RootRelativePath::from_relative(Path::new("selected.bin")).unwrap();
+        let _held = IndexLock::acquire(&internal_root(root)).unwrap();
+
+        let error = index_file(root, &relative).unwrap_err();
+
+        assert!(matches!(error, IndexFileError::LockBusy(_)));
     }
 
     // --- basic create / reuse / idempotence ---------------------------
@@ -881,7 +1829,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         write(root, "file.bin", b"content");
-        let _held = IndexLock::acquire(root).unwrap();
+        let _held = IndexLock::acquire(&internal_root(root)).unwrap();
 
         let err = index_root(root, None, false).unwrap_err();
         assert!(err.to_string().contains("index.lock"));

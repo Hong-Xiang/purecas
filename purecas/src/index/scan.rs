@@ -8,16 +8,19 @@
 
 use super::types::{FileSnapshot, FileTypeSuffix, IndexTimestamp, ObjectFileName, Sha256Digest};
 use anyhow::{bail, Context, Result};
+use rustix::fd::OwnedFd;
+use rustix::fs::{open, openat, Mode, OFlags};
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn sha256_dir(root: &Path) -> PathBuf {
-    root.join(".pcas").join("sha256")
+pub(crate) fn sha256_dir(internal_root: &Path) -> PathBuf {
+    internal_root.join("sha256")
 }
 
-pub(crate) fn shard_dir(root: &Path, digest: &Sha256Digest) -> PathBuf {
-    sha256_dir(root).join(digest.shard())
+pub(crate) fn shard_dir(internal_root: &Path, digest: &Sha256Digest) -> PathBuf {
+    sha256_dir(internal_root).join(digest.shard())
 }
 
 /// One validated object entry as found on disk during Phase 1.
@@ -27,13 +30,12 @@ pub(crate) struct ObjectRecord {
     pub timestamp: IndexTimestamp,
     pub suffix: Option<FileTypeSuffix>,
     pub path: PathBuf,
-    pub dev: u64,
-    pub ino: u64,
+    pub snapshot: FileSnapshot,
 }
 
 impl ObjectRecord {
     pub(crate) fn inode_key(&self) -> (u64, u64) {
-        (self.dev, self.ino)
+        self.snapshot.inode_key()
     }
 }
 
@@ -44,6 +46,7 @@ impl ObjectRecord {
 pub(crate) struct ObjectIndex {
     by_digest: HashMap<Sha256Digest, ObjectRecord>,
     by_inode: HashMap<(u64, u64), Sha256Digest>,
+    _held_shards: Vec<OwnedFd>,
 }
 
 impl ObjectIndex {
@@ -78,19 +81,35 @@ impl ObjectIndex {
     }
 }
 
+fn descriptor_path(fd: &impl AsFd) -> PathBuf {
+    PathBuf::from("/proc/self/fd").join(fd.as_fd().as_raw_fd().to_string())
+}
+
 /// Scan every shard directory under `.pcas/sha256` and validate every
 /// object entry found. Returns before any mutation is applied; malformed
 /// names, duplicate digests, conflicting inode claims, and non-regular
 /// entries are all reported here as a single corruption error.
-pub(crate) fn scan_object_index(root: &Path) -> Result<ObjectIndex> {
-    let mut index = ObjectIndex::default();
-
-    let dir = sha256_dir(root);
-    let shard_entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(index),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+pub(crate) fn scan_object_index(internal_root: &Path) -> Result<ObjectIndex> {
+    let dir = sha256_dir(internal_root);
+    let sha256 = match open(
+        &dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(rustix::io::Errno::NOENT) => return Ok(ObjectIndex::default()),
+        Err(error) => {
+            return Err(std::io::Error::from_raw_os_error(error.raw_os_error()))
+                .with_context(|| format!("opening {}", dir.display()))
+        }
     };
+    scan_object_index_fd(&sha256)
+}
+
+pub(crate) fn scan_object_index_fd(sha256: &impl AsFd) -> Result<ObjectIndex> {
+    let mut index = ObjectIndex::default();
+    let dir = descriptor_path(sha256);
+    let shard_entries = fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?;
 
     for shard_entry in shard_entries {
         let shard_entry = shard_entry.with_context(|| format!("reading {}", dir.display()))?;
@@ -106,6 +125,15 @@ pub(crate) fn scan_object_index(root: &Path) -> Result<ObjectIndex> {
             );
         }
         let shard_name = shard_entry.file_name();
+        let shard = openat(
+            sha256,
+            &shard_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .with_context(|| format!("opening shard {}", shard_path.display()))?;
+        let shard_path = descriptor_path(&shard);
         let shard_name = shard_name.to_str().with_context(|| {
             format!(
                 "shard directory name is not valid UTF-8: {}",
@@ -177,11 +205,11 @@ pub(crate) fn scan_object_index(root: &Path) -> Result<ObjectIndex> {
                 timestamp: parsed.timestamp().clone(),
                 suffix: parsed.suffix().cloned(),
                 path: object_path,
-                dev: snapshot.dev,
-                ino: snapshot.ino,
+                snapshot,
             };
             index.insert(record);
         }
+        index._held_shards.push(shard);
     }
 
     Ok(index)

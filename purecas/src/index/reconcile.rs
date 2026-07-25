@@ -7,14 +7,16 @@
 //! exact case analysis implemented here.
 
 use super::hash::hash_file_stable;
-use super::scan::{shard_dir, ObjectIndex, ObjectRecord};
+use super::scan::{ObjectIndex, ObjectRecord};
 use super::types::{
     FileSnapshot, FileTypeSuffix, IndexTimestamp, ObjectFileName, RootRelativePath, Sha256Digest,
 };
 use anyhow::{Context, Result};
+use rustix::fs::{linkat, renameat_with, statat, unlinkat, AtFlags, FileType, RenameFlags, CWD};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,11 +89,66 @@ pub struct IndexedFile {
 #[derive(Debug, Default)]
 pub struct ReconcileOutcome {
     pub created: Vec<IndexedFile>,
+    pub(crate) created_objects: Vec<CreatedObject>,
     pub failures: Vec<PathFailure>,
     pub indexed: usize,
     pub reused: usize,
     pub deduplicated: usize,
     pub repaired: usize,
+    pub(crate) selected_snapshot: Option<FileSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CreatedObject {
+    pub path: PathBuf,
+    pub snapshot: FileSnapshot,
+}
+
+struct ReconcileState<'a> {
+    index: &'a mut ObjectIndex,
+    verified: &'a mut HashSet<(u64, u64)>,
+    outcome: &'a mut ReconcileOutcome,
+}
+
+pub(crate) struct IndexDirs {
+    sha256_root: PathBuf,
+    tmp_root: PathBuf,
+    selected_shard: Option<(Sha256Digest, PathBuf)>,
+    selected_source: Option<fs::File>,
+}
+
+impl IndexDirs {
+    pub(crate) fn for_internal_root(internal_root: &Path) -> Self {
+        Self {
+            sha256_root: internal_root.join("sha256"),
+            tmp_root: internal_root.join("tmp"),
+            selected_shard: None,
+            selected_source: None,
+        }
+    }
+
+    pub(crate) fn for_pending(
+        sha256_root: PathBuf,
+        tmp_root: PathBuf,
+        digest: Sha256Digest,
+        shard: PathBuf,
+        source: fs::File,
+    ) -> Self {
+        Self {
+            sha256_root,
+            tmp_root,
+            selected_shard: Some((digest, shard)),
+            selected_source: Some(source),
+        }
+    }
+
+    fn shard(&self, digest: &Sha256Digest) -> PathBuf {
+        self.selected_shard
+            .as_ref()
+            .filter(|(selected, _)| selected == digest)
+            .map(|(_, path)| path.clone())
+            .unwrap_or_else(|| self.sha256_root.join(digest.shard()))
+    }
 }
 
 fn suffix_from_path(path: &Path) -> Option<FileTypeSuffix> {
@@ -102,13 +159,13 @@ fn suffix_from_path(path: &Path) -> Option<FileTypeSuffix> {
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A path under `.pcas/tmp` guaranteed unique within this process, used to
+/// A path under `internal_root/tmp` guaranteed unique within this process, used to
 /// stage a hard link before it is atomically renamed over a visible path.
 /// Staging here keeps an interrupted replacement out of visible discovery
 /// so a later `pcas index` can clean it up safely.
-fn unique_tmp_path(root: &Path) -> Result<PathBuf> {
-    let tmp_dir = root.join(".pcas").join("tmp");
-    fs::create_dir_all(&tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
+fn unique_tmp_path(dirs: &IndexDirs) -> Result<PathBuf> {
+    let tmp_dir = &dirs.tmp_root;
+    fs::create_dir_all(tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
     let pid = std::process::id();
     let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -122,34 +179,122 @@ fn unique_tmp_path(root: &Path) -> Result<PathBuf> {
 /// `source`. The caller must already have confirmed no object entry
 /// exists for this digest.
 fn create_object_entry(
-    root: &Path,
+    dirs: &IndexDirs,
     digest: &Sha256Digest,
     suffix: Option<FileTypeSuffix>,
     source: &Path,
+    expected_snapshot: FileSnapshot,
 ) -> Result<ObjectRecord> {
-    let dir = shard_dir(root, digest);
+    let dir = dirs.shard(digest);
     fs::create_dir_all(&dir)
         .with_context(|| format!("creating shard directory {}", dir.display()))?;
     let name = ObjectFileName::new(digest.clone(), IndexTimestamp::now(), suffix);
     let dest = dir.join(name.to_file_name());
-    fs::hard_link(source, &dest).with_context(|| {
-        format!(
-            "hard-linking {} to object entry {}",
-            source.display(),
-            dest.display()
+    if let Some(source_fd) = &dirs.selected_source {
+        let destination_dir =
+            fs::File::open(&dir).with_context(|| format!("opening {}", dir.display()))?;
+        let held_source = PathBuf::from("/proc/self/fd").join(source_fd.as_raw_fd().to_string());
+        linkat(
+            CWD,
+            &held_source,
+            &destination_dir,
+            name.to_file_name(),
+            AtFlags::SYMLINK_FOLLOW,
         )
-    })?;
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        .with_context(|| {
+            format!(
+                "hard-linking held upload inode to object entry {}",
+                dest.display()
+            )
+        })?;
+    } else {
+        fs::hard_link(source, &dest).with_context(|| {
+            format!(
+                "hard-linking {} to object entry {}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+    }
     let metadata =
         fs::metadata(&dest).with_context(|| format!("reading metadata of {}", dest.display()))?;
     let snapshot = FileSnapshot::from_metadata(&metadata);
+    if snapshot != expected_snapshot {
+        quarantine_mismatched_object(dirs, &dest, expected_snapshot)?;
+        anyhow::bail!(
+            "{} was replaced between hashing and object publication",
+            source.display()
+        );
+    }
     Ok(ObjectRecord {
         digest: digest.clone(),
         timestamp: name.timestamp().clone(),
         suffix: name.suffix().cloned(),
         path: dest,
-        dev: snapshot.dev,
-        ino: snapshot.ino,
+        snapshot,
     })
+}
+
+fn quarantine_mismatched_object(
+    dirs: &IndexDirs,
+    object: &Path,
+    expected: FileSnapshot,
+) -> Result<()> {
+    let parent_path = object
+        .parent()
+        .context("mismatched object has no parent directory")?;
+    let name = object
+        .file_name()
+        .context("mismatched object has no filename")?;
+    fs::create_dir_all(&dirs.tmp_root)
+        .with_context(|| format!("creating {}", dirs.tmp_root.display()))?;
+    let parent = fs::File::open(parent_path)
+        .with_context(|| format!("opening {}", parent_path.display()))?;
+    let quarantine = fs::File::open(&dirs.tmp_root)
+        .with_context(|| format!("opening {}", dirs.tmp_root.display()))?;
+    let quarantine_name = format!(
+        "mismatch-{:x}-{:x}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    match renameat_with(
+        &parent,
+        name,
+        &quarantine,
+        &quarantine_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(std::io::Error::from_raw_os_error(error.raw_os_error()))
+                .context("quarantining mismatched object entry")
+        }
+    }
+    let stat = statat(&quarantine, &quarantine_name, AtFlags::SYMLINK_NOFOLLOW).ok();
+    let matches = stat.is_some_and(|stat| {
+        FileType::from_raw_mode(stat.st_mode).is_file()
+            && stat.st_dev == expected.dev
+            && stat.st_ino == expected.ino
+    });
+    if matches {
+        unlinkat(&quarantine, &quarantine_name, AtFlags::empty())
+            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+            .context("deleting verified mismatched object entry")?;
+    }
+    Ok(())
+}
+
+fn link_failure_kind(error: &anyhow::Error) -> FailureKind {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::CrossesDevices)
+    {
+        FailureKind::CrossDevice
+    } else {
+        FailureKind::LinkFailed
+    }
 }
 
 /// Rename a stale object entry to a newly packed name for `new_digest`,
@@ -158,7 +303,7 @@ fn create_object_entry(
 /// `--rehash` repairs a retained object with no matching visible link
 /// this run (suffix preserved from the stale entry).
 fn rename_object_in_place(
-    root: &Path,
+    dirs: &IndexDirs,
     index: &mut ObjectIndex,
     old_digest: &Sha256Digest,
     new_digest: Sha256Digest,
@@ -167,7 +312,7 @@ fn rename_object_in_place(
     let old_record = index
         .remove(old_digest)
         .context("stale object record vanished during repair")?;
-    let new_dir = shard_dir(root, &new_digest);
+    let new_dir = dirs.shard(&new_digest);
     fs::create_dir_all(&new_dir)
         .with_context(|| format!("creating shard directory {}", new_dir.display()))?;
     let name = ObjectFileName::new(new_digest.clone(), IndexTimestamp::now(), suffix);
@@ -187,8 +332,7 @@ fn rename_object_in_place(
         timestamp: name.timestamp().clone(),
         suffix: name.suffix().cloned(),
         path: new_path,
-        dev: snapshot.dev,
-        ino: snapshot.ino,
+        snapshot,
     });
     Ok(())
 }
@@ -209,7 +353,7 @@ fn remove_stale_object_entry(index: &mut ObjectIndex, old_digest: &Sha256Digest)
 /// and verify the replacement now shares the canonical inode. Cleans the
 /// temporary link on every error and never falls back to copying.
 fn dedup_visible_onto_canonical(
-    root: &Path,
+    dirs: &IndexDirs,
     canonical_object_path: &Path,
     visible_path: &Path,
 ) -> Result<(), PathFailure> {
@@ -219,7 +363,7 @@ fn dedup_visible_onto_canonical(
         message,
     };
 
-    let tmp_path = unique_tmp_path(root).map_err(|e| {
+    let tmp_path = unique_tmp_path(dirs).map_err(|e| {
         fail(
             FailureKind::LinkFailed,
             format!("staging temporary link: {e}"),
@@ -227,8 +371,13 @@ fn dedup_visible_onto_canonical(
     })?;
 
     fs::hard_link(canonical_object_path, &tmp_path).map_err(|e| {
+        let kind = if e.kind() == std::io::ErrorKind::CrossesDevices {
+            FailureKind::CrossDevice
+        } else {
+            FailureKind::LinkFailed
+        };
         fail(
-            FailureKind::LinkFailed,
+            kind,
             format!(
                 "hard-linking canonical object {} to temporary {}: {e}",
                 canonical_object_path.display(),
@@ -280,68 +429,138 @@ fn dedup_visible_onto_canonical(
 /// against the object index, applying the create/reuse/dedup/repair rules
 /// from the design.
 fn apply_digest_for_visible_path(
-    root: &Path,
+    dirs: &IndexDirs,
     rel: &RootRelativePath,
     path: &Path,
     digest: &Sha256Digest,
-    inode_key: (u64, u64),
-    index: &mut ObjectIndex,
-    outcome: &mut ReconcileOutcome,
+    snapshot: FileSnapshot,
+    state: &mut ReconcileState<'_>,
 ) -> Result<(), PathFailure> {
-    let existing_for_digest = index.get_by_digest(digest).cloned();
+    let inode_key = snapshot.inode_key();
+    let existing_for_digest = state.index.get_by_digest(digest).cloned();
     if let Some(record) = &existing_for_digest {
         if record.inode_key() == inode_key {
-            outcome.reused += 1;
+            state.outcome.reused += 1;
+            state.outcome.selected_snapshot = Some(snapshot);
             return Ok(());
         }
     }
+    let existing_for_inode = state.index.get_digest_at_inode(inode_key).cloned();
+    let mut verified_canonical = None;
 
-    let existing_for_inode = index.get_digest_at_inode(inode_key).cloned();
+    if let Some(record) = &existing_for_digest {
+        let canonical = hash_file_stable(&record.path).map_err(|error| PathFailure {
+            path: record.path.clone(),
+            kind: FailureKind::Unstable,
+            message: error.to_string(),
+        })?;
+        if canonical.digest != *digest {
+            remove_stale_object_entry(state.index, digest).map_err(|error| PathFailure {
+                path: record.path.clone(),
+                kind: FailureKind::RenameFailed,
+                message: error.to_string(),
+            })?;
+            if let Some(old_digest) = &existing_for_inode {
+                rename_object_in_place(
+                    dirs,
+                    state.index,
+                    old_digest,
+                    digest.clone(),
+                    suffix_from_path(rel.as_path()),
+                )
+                .map_err(|error| PathFailure {
+                    path: path.to_path_buf(),
+                    kind: FailureKind::RenameFailed,
+                    message: error.to_string(),
+                })?;
+            } else {
+                let replacement = create_object_entry(
+                    dirs,
+                    digest,
+                    suffix_from_path(rel.as_path()),
+                    path,
+                    snapshot,
+                )
+                .map_err(|error| PathFailure {
+                    path: path.to_path_buf(),
+                    kind: link_failure_kind(&error),
+                    message: error.to_string(),
+                })?;
+                state.outcome.created.push(IndexedFile {
+                    digest: digest.clone(),
+                    relative_path: rel.clone(),
+                    object_path: replacement.path.clone(),
+                });
+                state.outcome.created_objects.push(CreatedObject {
+                    path: replacement.path.clone(),
+                    snapshot: replacement.snapshot,
+                });
+                state.index.insert(replacement);
+            }
+            state.outcome.repaired += 1;
+            state.outcome.selected_snapshot = Some(snapshot);
+            return Ok(());
+        }
+        verified_canonical = Some(canonical.snapshot);
+    }
 
     match existing_for_digest {
         None => match existing_for_inode {
             None => {
-                let record = create_object_entry(root, digest, suffix_from_path(path), path)
-                    .map_err(|e| PathFailure {
-                        path: path.to_path_buf(),
-                        kind: FailureKind::LinkFailed,
-                        message: e.to_string(),
-                    })?;
-                outcome.created.push(IndexedFile {
+                let record = create_object_entry(
+                    dirs,
+                    digest,
+                    suffix_from_path(rel.as_path()),
+                    path,
+                    snapshot,
+                )
+                .map_err(|e| PathFailure {
+                    path: path.to_path_buf(),
+                    kind: link_failure_kind(&e),
+                    message: e.to_string(),
+                })?;
+                state.outcome.created.push(IndexedFile {
                     digest: digest.clone(),
                     relative_path: rel.clone(),
                     object_path: record.path.clone(),
                 });
-                index.insert(record);
-                outcome.indexed += 1;
+                state.outcome.created_objects.push(CreatedObject {
+                    path: record.path.clone(),
+                    snapshot: record.snapshot,
+                });
+                state.index.insert(record);
+                state.outcome.indexed += 1;
+                state.outcome.selected_snapshot = Some(snapshot);
             }
             Some(old_digest) => {
                 rename_object_in_place(
-                    root,
-                    index,
+                    dirs,
+                    state.index,
                     &old_digest,
                     digest.clone(),
-                    suffix_from_path(path),
+                    suffix_from_path(rel.as_path()),
                 )
                 .map_err(|e| PathFailure {
                     path: path.to_path_buf(),
                     kind: FailureKind::RenameFailed,
                     message: e.to_string(),
                 })?;
-                outcome.repaired += 1;
+                state.outcome.repaired += 1;
+                state.outcome.selected_snapshot = Some(snapshot);
             }
         },
         Some(record) => {
             if let Some(old_digest) = existing_for_inode {
-                remove_stale_object_entry(index, &old_digest).map_err(|e| PathFailure {
+                remove_stale_object_entry(state.index, &old_digest).map_err(|e| PathFailure {
                     path: path.to_path_buf(),
                     kind: FailureKind::RenameFailed,
                     message: e.to_string(),
                 })?;
-                outcome.repaired += 1;
+                state.outcome.repaired += 1;
             }
-            dedup_visible_onto_canonical(root, &record.path, path)?;
-            outcome.deduplicated += 1;
+            dedup_visible_onto_canonical(dirs, &record.path, path)?;
+            state.outcome.deduplicated += 1;
+            state.outcome.selected_snapshot = verified_canonical;
         }
     }
     Ok(())
@@ -351,13 +570,11 @@ fn apply_digest_for_visible_path(
 /// hashing when possible, otherwise hash it stably and reconcile the
 /// result.
 fn reconcile_one_visible_file(
-    root: &Path,
+    dirs: &IndexDirs,
     rel: &RootRelativePath,
     path: &Path,
     rehash: bool,
-    index: &mut ObjectIndex,
-    verified: &mut HashSet<(u64, u64)>,
-    outcome: &mut ReconcileOutcome,
+    state: &mut ReconcileState<'_>,
 ) -> Result<(), PathFailure> {
     let metadata = fs::metadata(path).map_err(|e| PathFailure {
         path: path.to_path_buf(),
@@ -367,13 +584,18 @@ fn reconcile_one_visible_file(
     let snapshot = FileSnapshot::from_metadata(&metadata);
 
     if !rehash {
-        if let Some(digest) = index.get_digest_at_inode(snapshot.inode_key()).cloned() {
-            let record = index
+        if let Some(digest) = state
+            .index
+            .get_digest_at_inode(snapshot.inode_key())
+            .cloned()
+        {
+            let record = state
+                .index
                 .get_by_digest(&digest)
                 .expect("inode map stays consistent with digest map");
             if snapshot.mtime_at_or_before(&record.timestamp) {
-                outcome.reused += 1;
-                verified.insert(snapshot.inode_key());
+                state.outcome.reused += 1;
+                state.verified.insert(snapshot.inode_key());
                 return Ok(());
             }
         }
@@ -384,24 +606,16 @@ fn reconcile_one_visible_file(
         kind: FailureKind::Unstable,
         message: e.to_string(),
     })?;
-    verified.insert(hashed.snapshot.inode_key());
+    state.verified.insert(hashed.snapshot.inode_key());
 
-    apply_digest_for_visible_path(
-        root,
-        rel,
-        path,
-        &hashed.digest,
-        hashed.snapshot.inode_key(),
-        index,
-        outcome,
-    )
+    apply_digest_for_visible_path(dirs, rel, path, &hashed.digest, hashed.snapshot, state)
 }
 
 /// Reconcile one retained object with no visible link verified this run
 /// (`--rehash` only): repair it in place if its bytes changed, otherwise
 /// leave it untouched. Returns whether a repair occurred.
 fn reconcile_retained_object(
-    root: &Path,
+    dirs: &IndexDirs,
     index: &mut ObjectIndex,
     old_digest: &Sha256Digest,
     object_path: &Path,
@@ -417,7 +631,7 @@ fn reconcile_retained_object(
             let suffix = index
                 .get_by_digest(old_digest)
                 .and_then(|r| r.suffix.clone());
-            rename_object_in_place(root, index, old_digest, new_digest, suffix).map_err(|e| {
+            rename_object_in_place(dirs, index, old_digest, new_digest, suffix).map_err(|e| {
                 PathFailure {
                     path: object_path.to_path_buf(),
                     kind: FailureKind::RenameFailed,
@@ -439,7 +653,7 @@ fn reconcile_retained_object(
 /// Under `--rehash`, verify every retained object inode not already
 /// verified through a selected visible link this run, repairing mismatches.
 fn reconcile_retained_objects(
-    root: &Path,
+    dirs: &IndexDirs,
     index: &mut ObjectIndex,
     verified: &HashSet<(u64, u64)>,
     outcome: &mut ReconcileOutcome,
@@ -465,7 +679,7 @@ fn reconcile_retained_objects(
             }),
             Ok(hashed) => {
                 match reconcile_retained_object(
-                    root,
+                    dirs,
                     index,
                     &old_digest,
                     &object_path,
@@ -483,7 +697,7 @@ fn reconcile_retained_objects(
 /// Run Phases 2-3 (and, under `--rehash`, retained-object verification)
 /// against `index`, mutating it in place to reflect every applied repair.
 pub(crate) fn reconcile(
-    root: &Path,
+    dirs: &IndexDirs,
     index: &mut ObjectIndex,
     selected: &[(RootRelativePath, PathBuf)],
     rehash: bool,
@@ -491,18 +705,49 @@ pub(crate) fn reconcile(
     let mut outcome = ReconcileOutcome::default();
     let mut verified = HashSet::new();
 
-    for (rel, path) in selected {
-        if let Err(failure) =
-            reconcile_one_visible_file(root, rel, path, rehash, index, &mut verified, &mut outcome)
-        {
-            outcome.failures.push(failure);
+    {
+        let mut state = ReconcileState {
+            index,
+            verified: &mut verified,
+            outcome: &mut outcome,
+        };
+        for (rel, path) in selected {
+            if let Err(failure) = reconcile_one_visible_file(dirs, rel, path, rehash, &mut state) {
+                state.outcome.failures.push(failure);
+            }
         }
     }
 
     if rehash {
-        reconcile_retained_objects(root, index, &verified, &mut outcome);
+        reconcile_retained_objects(dirs, index, &verified, &mut outcome);
     }
 
+    outcome
+}
+
+/// Reconcile one already-hashed file without reading its bytes again. Used by
+/// HTTP ingestion after the request stream has been hashed and synced outside
+/// the global index lock.
+pub(crate) fn reconcile_prehashed(
+    dirs: &IndexDirs,
+    index: &mut ObjectIndex,
+    relative_path: &RootRelativePath,
+    path: &Path,
+    digest: &Sha256Digest,
+    snapshot: FileSnapshot,
+) -> ReconcileOutcome {
+    let mut outcome = ReconcileOutcome::default();
+    let mut verified = HashSet::new();
+    let mut state = ReconcileState {
+        index,
+        verified: &mut verified,
+        outcome: &mut outcome,
+    };
+    if let Err(failure) =
+        apply_digest_for_visible_path(dirs, relative_path, path, digest, snapshot, &mut state)
+    {
+        state.outcome.failures.push(failure);
+    }
     outcome
 }
 
@@ -512,6 +757,14 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn internal(root: &Path) -> PathBuf {
+        root.join(".pcas")
+    }
+
+    fn dirs(root: &Path) -> IndexDirs {
+        IndexDirs::for_internal_root(&internal(root))
+    }
+
     #[test]
     fn dedup_onto_canonical_reports_link_failed_when_canonical_source_is_missing() {
         let dir = TempDir::new().unwrap();
@@ -520,7 +773,8 @@ mod tests {
         fs::write(&visible, b"x").unwrap();
         let missing_canonical = root.join("does-not-exist");
 
-        let err = dedup_visible_onto_canonical(root, &missing_canonical, &visible).unwrap_err();
+        let err =
+            dedup_visible_onto_canonical(&dirs(root), &missing_canonical, &visible).unwrap_err();
         assert_eq!(err.kind, FailureKind::LinkFailed);
     }
 
@@ -534,7 +788,7 @@ mod tests {
         // final rename must fail.
         let visible = root.join("missing-parent-dir").join("visible.bin");
 
-        let err = dedup_visible_onto_canonical(root, &canonical, &visible).unwrap_err();
+        let err = dedup_visible_onto_canonical(&dirs(root), &canonical, &visible).unwrap_err();
         assert_eq!(err.kind, FailureKind::RenameFailed);
 
         let tmp_dir = root.join(".pcas").join("tmp");
@@ -556,7 +810,7 @@ mod tests {
         let visible = root.join("visible.bin");
         fs::write(&visible, b"different bytes for now").unwrap();
 
-        dedup_visible_onto_canonical(root, &canonical, &visible).unwrap();
+        dedup_visible_onto_canonical(&dirs(root), &canonical, &visible).unwrap();
 
         let canonical_meta = fs::metadata(&canonical).unwrap();
         let visible_meta = fs::metadata(&visible).unwrap();
@@ -568,6 +822,28 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "the temporary link must not remain after success"
+        );
+    }
+
+    #[test]
+    fn object_creation_rejects_source_replaced_after_hashing() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let source = root.join("source.bin");
+        fs::write(&source, b"original").unwrap();
+        let _original = fs::File::open(&source).unwrap();
+        let expected = FileSnapshot::from_metadata(&fs::metadata(&source).unwrap());
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        let digest = Sha256Digest::parse(&"a".repeat(64)).unwrap();
+
+        let error = create_object_entry(&dirs(root), &digest, None, &source, expected).unwrap_err();
+
+        assert!(error.to_string().contains("replaced between hashing"));
+        assert_eq!(
+            fs::read_dir(dirs(root).shard(&digest)).unwrap().count(),
+            0,
+            "the mismatched object entry must be removed"
         );
     }
 }

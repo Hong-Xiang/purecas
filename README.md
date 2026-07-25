@@ -197,12 +197,12 @@ cat "$(pcas path a3f2c1dead...)" > restored_file.mp4
 ### `pcas serve`
 
 ```bash
-pcas [--root ROOT] serve [--bind ADDRESS]
+pcas [--root ROOT] serve [--bind ADDRESS] [--allow-ingest]
 ```
 
-Exposes the visible hierarchy and immutable digest access as a read-only
-HTTP server, binding to `127.0.0.1:8000` by default (loopback-only,
-because this server has no authentication or TLS):
+Exposes the visible hierarchy and immutable digest access over HTTP. The
+server is read-only by default and binds to `127.0.0.1:8000` (loopback-only,
+because it has no authentication or TLS):
 
 ```bash
 pcas serve
@@ -232,6 +232,69 @@ conditional requests (`If-Match`, `If-Unmodified-Since`, `If-None-Match`,
 `If-Range`), including single-range and `multipart/byteranges` responses.
 Unsupported methods return `405 Method Not Allowed` with
 `Allow: GET, HEAD`.
+
+#### Opt-in HTTP ingestion
+
+`--allow-ingest` additionally accepts a raw request body at an exact visible
+destination:
+
+```bash
+pcas --root /data/models serve --allow-ingest
+
+curl --fail-with-body \
+  --data-binary @weights.safetensors \
+  http://127.0.0.1:8000/models/resnet50/weights.safetensors
+```
+
+**Security warning:** `pcas serve` provides no authentication or TLS.
+Write-enabled mode should bind only to a trusted interface, or run behind an
+authenticated TLS proxy. Do not expose `--allow-ingest` directly to an
+untrusted network.
+
+**Threat model:** HTTP clients are untrusted. The local operator, repository
+filesystem, and same-UID local processes are trusted; defending against a
+malicious local co-owner racing filesystem entries during a transaction is
+out of scope. Pre-existing symlink/path escapes and accidental replacement
+are still rejected. Normal concurrent uploads and `pcas index`/`pcas serve`
+operations coordinate through purecas's index lock.
+
+- `POST /<visible/root-relative/path>` streams the raw body to that exact
+  destination. It is not multipart. Missing parent directories are created.
+  The body is processed chunk by chunk rather than accumulated in memory.
+- Publication is create-only: an existing file returns `409 Conflict`; there
+  is no overwrite, delete, resumable-upload, or query-controlled mode.
+- The body is streamed into a temporary inode under `.pcas/ingest-tmp`,
+  hashed, and synced before taking the global index lock. Per-upload advisory
+  lock sidecars distinguish active streams from crash leftovers; writable
+  server startup and later uploads reclaim stale temporary links.
+- The same path rules as the hierarchy route apply. Traversal, malformed
+  encoding, root escapes, directories, symlinked parent components,
+  top-level `.pcas`/`purecas.db`, and the reserved top-level `pcas` digest
+  namespace cannot be upload destinations.
+- The server waits at most one second for `.pcas/index.lock`. A timeout
+  returns `503 Service Unavailable` with `Retry-After: 1`; no visible file is
+  published, so the same POST can be retried.
+- While holding the lock, the server reconciles exactly the temporary inode
+  into the canonical object index, then atomically publishes the visible path
+  with create-only semantics. It does not discover unrelated visible files,
+  prune globally, invoke a subprocess, or open/create `purecas.db`.
+- Temporary, parent, internal-index, and destination access is
+  descriptor-relative and does not follow symlinks. Source and destination
+  must be on the same filesystem; a cross-device destination returns an
+  explicit `409 Conflict` without copying.
+- Body, write, lock, index, cross-device, and publication failures leave no
+  temporary or new visible file. There is no visible-but-unindexed window.
+- Success is `201 Created` with `Location` set to
+  `/pcas/<lowercase-sha256>`, a strong digest `ETag`, and JSON:
+
+  ```json
+  {"digest":"<lowercase-sha256>","path":"models/resnet50/weights.safetensors"}
+  ```
+
+  `path` is the lossless, percent-encoded root-relative hierarchy path.
+- With ingestion enabled, unsupported hierarchy methods return `405` with
+  `Allow: GET, HEAD, POST`. Exact `/pcas/<digest>` routes remain read-only
+  with `Allow: GET, HEAD`.
 
 The two routes differ only in identity, cache policy, and MIME hints:
 

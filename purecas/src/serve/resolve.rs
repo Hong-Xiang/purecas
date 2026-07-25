@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 pub struct Root {
     canonical_root: PathBuf,
     pcas_path: PathBuf,
+    root_dir: std::fs::File,
 }
 
 impl Root {
@@ -35,14 +36,21 @@ impl Root {
             canonical_root.display()
         );
         let pcas_path = canonical_root.join(".pcas");
+        let root_dir = std::fs::File::open(&canonical_root)
+            .with_context(|| format!("opening PCAS_ROOT {}", canonical_root.display()))?;
         Ok(Self {
             canonical_root,
             pcas_path,
+            root_dir,
         })
     }
 
     pub fn canonical_root(&self) -> &Path {
         &self.canonical_root
+    }
+
+    pub(crate) fn try_clone_dir(&self) -> std::io::Result<std::fs::File> {
+        self.root_dir.try_clone()
     }
 }
 

@@ -800,6 +800,27 @@ fn test_serve_binds_and_serves_a_file_over_http_without_touching_purecas_db() {
     assert!(line.contains("listening on http://"), "{line}");
     let addr = line.trim().rsplit("http://").next().unwrap().to_string();
 
+    let mut disabled_post =
+        std::net::TcpStream::connect(&addr).expect("connecting to read-only pcas serve");
+    write!(
+        disabled_post,
+        "POST /disabled.bin HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 7\r\nConnection: close\r\n\r\nblocked"
+    )
+    .unwrap();
+    let mut disabled_response = String::new();
+    disabled_post
+        .read_to_string(&mut disabled_response)
+        .unwrap();
+    assert!(
+        disabled_response.starts_with("HTTP/1.1 405"),
+        "{disabled_response}"
+    );
+    assert!(
+        disabled_response.contains("allow: GET, HEAD\r\n"),
+        "{disabled_response}"
+    );
+    assert!(!root.path().join("disabled.bin").exists());
+
     let mut stream = std::net::TcpStream::connect(&addr).expect("connecting to pcas serve");
     write!(
         stream,
@@ -815,6 +836,76 @@ fn test_serve_binds_and_serves_a_file_over_http_without_touching_purecas_db() {
         !root.path().join("purecas.db").exists(),
         "serve must never create purecas.db"
     );
+
+    child.kill().expect("killing server process");
+    child.wait().expect("waiting for server process to exit");
+}
+
+#[test]
+fn test_serve_help_documents_allow_ingest_flag() {
+    pcas()
+        .args(["serve", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--allow-ingest"));
+}
+
+#[test]
+fn test_serve_allow_ingest_uploads_and_indexes_without_sqlite() {
+    use std::io::{BufRead, Read, Write};
+
+    let root = cas_root();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pcas"))
+        .args(["--root", root.path().to_str().unwrap()])
+        .args(["serve", "--bind", "127.0.0.1:0", "--allow-ingest"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning writable `pcas serve`");
+
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("reading server startup line");
+    assert!(line.contains("listening on http://"), "{line}");
+    let addr = line.trim().rsplit("http://").next().unwrap().to_string();
+
+    let mut upload = std::net::TcpStream::connect(&addr).expect("connecting for upload");
+    write!(
+        upload,
+        "POST /cli/nested.bin HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 12\r\nConnection: close\r\n\r\ncli uploaded"
+    )
+    .unwrap();
+    let mut upload_response = String::new();
+    upload.read_to_string(&mut upload_response).unwrap();
+    assert!(
+        upload_response.starts_with("HTTP/1.1 201"),
+        "{upload_response}"
+    );
+    assert!(
+        upload_response.contains("location: /pcas/"),
+        "{upload_response}"
+    );
+    assert!(upload_response.contains("etag: \""), "{upload_response}");
+
+    let mut read_back = std::net::TcpStream::connect(&addr).expect("connecting for read-back");
+    write!(
+        read_back,
+        "GET /cli/nested.bin HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut read_response = String::new();
+    read_back.read_to_string(&mut read_response).unwrap();
+    assert!(read_response.starts_with("HTTP/1.1 200"), "{read_response}");
+    assert!(read_response.ends_with("cli uploaded"), "{read_response}");
+
+    assert_eq!(
+        fs::read(root.path().join("cli/nested.bin")).unwrap(),
+        b"cli uploaded"
+    );
+    assert!(root.path().join(".pcas/sha256").exists());
+    assert!(!root.path().join("purecas.db").exists());
 
     child.kill().expect("killing server process");
     child.wait().expect("waiting for server process to exit");

@@ -4,19 +4,22 @@
 //! only function that actually binds a socket.
 
 use crate::serve::digest;
+use crate::serve::ingest::{self, IngestError};
 use crate::serve::listing;
 use crate::serve::path::{self, PathError, VisiblePath};
 use crate::serve::representation::Representation;
 use crate::serve::resolve::{self, Resolved, Root};
 use crate::serve::respond;
+use crate::serve::IngestionMode;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use headers::{CacheControl, HeaderMapExt};
-use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use serde_json::json;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,11 +27,19 @@ use std::sync::Arc;
 /// Shared, immutable server state.
 pub struct AppState {
     root: Root,
+    ingestion: IngestionMode,
 }
 
 impl AppState {
     pub fn new(root: Root) -> Self {
-        Self { root }
+        Self {
+            root,
+            ingestion: IngestionMode::ReadOnly,
+        }
+    }
+
+    pub fn with_ingestion(root: Root, ingestion: IngestionMode) -> Self {
+        Self { root, ingestion }
     }
 }
 
@@ -40,16 +51,16 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
-    if !matches!(method, Method::GET | Method::HEAD) {
-        return method_not_allowed();
-    }
+    let raw_path = req.uri().path().to_string();
 
     // The digest route is intercepted from the exact raw request path,
     // before any percent-decoding or visible-path parsing: every other
     // top-level `/pcas` form falls through to ordinary dispatch below,
     // which already rejects the reserved `pcas` segment with `404`.
-    let raw_path = req.uri().path();
-    if let Some(raw_digest) = digest::match_route(raw_path) {
+    if let Some(raw_digest) = digest::match_route(&raw_path) {
+        if !matches!(method, Method::GET | Method::HEAD) {
+            return method_not_allowed(false);
+        }
         return match digest::dispatch(
             state.root.canonical_root(),
             &method,
@@ -66,13 +77,46 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
         };
     }
 
-    let parsed = match path::parse(raw_path) {
+    let is_ingest = method == Method::POST && state.ingestion == IngestionMode::Allow;
+    if !matches!(method, Method::GET | Method::HEAD) && !is_ingest {
+        return method_not_allowed(state.ingestion == IngestionMode::Allow);
+    }
+
+    let parsed = match path::parse(&raw_path) {
         Ok(parsed) => parsed,
         Err(PathError::MalformedPercentEncoding | PathError::Nul) => return bad_request(),
         Err(PathError::Invalid | PathError::ReservedTopLevel | PathError::LegacyDatabase) => {
             return not_found()
         }
     };
+
+    if is_ingest {
+        return match ingest::ingest(&state.root, parsed, req.into_body()).await {
+            Ok(indexed) => created(indexed),
+            Err(IngestError::NotFound) => not_found(),
+            Err(IngestError::Conflict) => conflict(),
+            Err(IngestError::BadBody(error)) => {
+                log_internal_error(&error);
+                bad_request()
+            }
+            Err(IngestError::Internal(error)) => {
+                log_internal_error(&error);
+                internal_error()
+            }
+            Err(IngestError::IndexBusy(error)) => {
+                log_internal_error(&error);
+                index_lock_timeout()
+            }
+            Err(IngestError::CrossDevice(error)) => {
+                log_internal_error(&error);
+                cross_device()
+            }
+            Err(IngestError::IndexFailed(error)) => {
+                log_internal_error(&error);
+                internal_error()
+            }
+        };
+    }
 
     match dispatch(&state, &method, req.uri(), req.headers(), &parsed).await {
         Ok(response) => response,
@@ -232,11 +276,18 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
-fn method_not_allowed() -> Response {
+fn conflict() -> Response {
+    (StatusCode::CONFLICT, "Conflict").into_response()
+}
+
+fn method_not_allowed(allow_ingest: bool) -> Response {
     let mut response = (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed").into_response();
-    response
-        .headers_mut()
-        .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+    let allow = if allow_ingest {
+        HeaderValue::from_static("GET, HEAD, POST")
+    } else {
+        HeaderValue::from_static("GET, HEAD")
+    };
+    response.headers_mut().insert(ALLOW, allow);
     response
 }
 
@@ -244,10 +295,75 @@ fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
 }
 
+fn json_response(status: StatusCode, value: serde_json::Value) -> Response {
+    let body = serde_json::to_vec(&value).expect("serializing a JSON value is infallible");
+    let mut response = Response::new(Body::from(body.clone()));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string())
+            .expect("decimal length is a valid header value"),
+    );
+    response
+}
+
+fn created(indexed: ingest::Ingested) -> Response {
+    let digest = indexed.digest.as_str().to_string();
+    let mut response = json_response(
+        StatusCode::CREATED,
+        json!({
+            "digest": digest,
+            "path": indexed.relative_path,
+        }),
+    );
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("/pcas/{}", indexed.digest))
+            .expect("digest URL is a valid header"),
+    );
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", indexed.digest))
+            .expect("hex digest is a valid entity tag"),
+    );
+    response
+}
+
+fn index_lock_timeout() -> Response {
+    let mut response = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "error": "index_lock_timeout",
+            "published": false,
+            "retry": true,
+        }),
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+fn cross_device() -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "cross_filesystem_destination",
+            "published": false,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
     use http_body_util::BodyExt;
+    use std::fs::OpenOptions;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -256,17 +372,35 @@ mod tests {
         router(Arc::new(AppState::new(root)))
     }
 
+    fn make_ingest_router(root: &Path) -> Router {
+        let root = Root::open(root).unwrap();
+        router(Arc::new(AppState::with_ingestion(
+            root,
+            IngestionMode::Allow,
+        )))
+    }
+
     async fn request(
         router: Router,
         method: Method,
         uri: &str,
         headers: &[(&str, &str)],
     ) -> Response {
+        request_with_body(router, method, uri, headers, Body::empty()).await
+    }
+
+    async fn request_with_body(
+        router: Router,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Body,
+    ) -> Response {
         let mut builder = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
-        let req = builder.body(Body::empty()).unwrap();
+        let req = builder.body(body).unwrap();
         router.oneshot(req).await.unwrap()
     }
 
@@ -286,6 +420,17 @@ mod tests {
 
     fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
         response.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn assert_ingest_tmp_empty(root: &Path) {
+        let tmp = root.join(".pcas/ingest-tmp");
+        if tmp.exists() {
+            assert_eq!(
+                std::fs::read_dir(tmp).unwrap().count(),
+                0,
+                "ingestion temporary directory must be empty"
+            );
+        }
     }
 
     /// Write one file and index it, returning the resulting digest as a
@@ -746,6 +891,407 @@ mod tests {
             );
             assert_eq!(header(&response, "allow"), Some("GET, HEAD"));
         }
+    }
+
+    #[tokio::test]
+    async fn enabled_upload_indexes_exact_nested_path_and_reads_back_ranges() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("unrelated.bin"), b"must remain unindexed").unwrap();
+        let content = b"0123456789 uploaded";
+
+        let uploaded = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/nested/a%20b.bin",
+            &[],
+            Body::from(content.as_slice()),
+        )
+        .await;
+
+        assert_eq!(uploaded.status(), StatusCode::CREATED);
+        let location = header(&uploaded, "location").unwrap().to_string();
+        let etag = header(&uploaded, "etag").unwrap().to_string();
+        assert!(!etag.starts_with("W/"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(uploaded).await).unwrap();
+        let digest = payload["digest"].as_str().unwrap();
+        assert_eq!(location, format!("/pcas/{digest}"));
+        assert_eq!(etag, format!("\"{digest}\""));
+        assert_eq!(payload["path"], "nested/a%20b.bin");
+        assert_eq!(
+            std::fs::read(dir.path().join("nested/a b.bin")).unwrap(),
+            content
+        );
+
+        let hierarchy = request(
+            make_ingest_router(dir.path()),
+            Method::GET,
+            "/nested/a%20b.bin",
+            &[("range", "bytes=2-5")],
+        )
+        .await;
+        assert_eq!(hierarchy.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(hierarchy).await, b"2345");
+
+        let digest_uri = format!("/pcas/{digest}");
+        let by_digest = request(
+            make_ingest_router(dir.path()),
+            Method::GET,
+            &digest_uri,
+            &[("range", "bytes=11-18")],
+        )
+        .await;
+        assert_eq!(by_digest.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(by_digest).await, b"uploaded");
+
+        let unrelated_digest = crate::store::hash_file(&dir.path().join("unrelated.bin")).unwrap();
+        assert!(matches!(
+            crate::index::resolve_digest(dir.path(), &unrelated_digest),
+            Err(crate::index::DigestResolutionError::NotFound(_))
+        ));
+        assert!(!dir.path().join("purecas.db").exists());
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn upload_streams_many_large_chunks_without_buffering_the_body() {
+        let dir = TempDir::new().unwrap();
+        let chunk = Bytes::from(vec![0x5a; 16 * 1024]);
+        let chunks = (0..256)
+            .map(|_| Ok::<_, std::io::Error>(chunk.clone()))
+            .collect::<Vec<_>>();
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/large.bin",
+            &[],
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("large.bin"))
+                .unwrap()
+                .len(),
+            4 * 1024 * 1024
+        );
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn upload_uses_visible_suffix_for_digest_mime() {
+        let dir = TempDir::new().unwrap();
+        let uploaded = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/movie.mp4",
+            &[],
+            Body::from("video bytes"),
+        )
+        .await;
+        assert_eq!(uploaded.status(), StatusCode::CREATED);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(uploaded).await).unwrap();
+        let digest = payload["digest"].as_str().unwrap();
+
+        let response = get(make_ingest_router(dir.path()), &format!("/pcas/{digest}")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, "content-type"), Some("video/mp4"));
+    }
+
+    #[tokio::test]
+    async fn upload_collision_is_409_and_preserves_existing_bytes() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("existing.bin"), b"original").unwrap();
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/existing.bin",
+            &[],
+            Body::from("replacement"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(dir.path().join("existing.bin")).unwrap(),
+            b"original"
+        );
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_path_uploads_have_one_create_only_winner() {
+        let dir = TempDir::new().unwrap();
+        let app = make_ingest_router(dir.path());
+
+        let first = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/race.bin",
+            &[],
+            Body::from("first"),
+        );
+        let second = request_with_body(app, Method::POST, "/race.bin", &[], Body::from("second"));
+        let (first, second) = tokio::join!(first, second);
+
+        let mut statuses = [first.status(), second.status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+        let bytes = std::fs::read(dir.path().join("race.bin")).unwrap();
+        assert!(bytes == b"first" || bytes == b"second");
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_upload_succeeds_with_canonical_digest_and_inode() {
+        let dir = TempDir::new().unwrap();
+
+        let first = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/first.bin",
+            &[],
+            Body::from("same content"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(first).await).unwrap();
+
+        let second = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/second.bin",
+            &[],
+            Body::from("same content"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(second).await).unwrap();
+
+        assert_eq!(first_payload["digest"], second_payload["digest"]);
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(dir.path().join("first.bin"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(dir.path().join("second.bin"))
+                .unwrap()
+                .ino()
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_upload_repairs_corrupt_canonical_without_losing_uploaded_bytes() {
+        let dir = TempDir::new().unwrap();
+        let original = b"original content";
+
+        let first = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/first.bin",
+            &[],
+            Body::from(original.as_slice()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(first).await).unwrap();
+        let digest = first_payload["digest"].as_str().unwrap();
+
+        std::fs::write(dir.path().join("first.bin"), b"corrupt content!").unwrap();
+
+        let second = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/second.bin",
+            &[],
+            Body::from(original.as_slice()),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(second).await).unwrap();
+        assert_eq!(second_payload["digest"], digest);
+        assert_eq!(
+            std::fs::read(dir.path().join("second.bin")).unwrap(),
+            original
+        );
+
+        let by_digest = get(make_ingest_router(dir.path()), &format!("/pcas/{digest}")).await;
+        assert_eq!(by_digest.status(), StatusCode::OK);
+        assert_eq!(body_bytes(by_digest).await, original);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_invalid_reserved_and_directory_paths() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("directory")).unwrap();
+        let digest = "a".repeat(64);
+        let cases = [
+            ("/", StatusCode::NOT_FOUND, None),
+            ("/directory/", StatusCode::NOT_FOUND, None),
+            ("/directory", StatusCode::NOT_FOUND, None),
+            ("/a/./b", StatusCode::NOT_FOUND, None),
+            ("/a/%2e%2e/b", StatusCode::NOT_FOUND, None),
+            ("/.pcas/object", StatusCode::NOT_FOUND, None),
+            ("/purecas.db", StatusCode::NOT_FOUND, None),
+            ("/bad%zz", StatusCode::BAD_REQUEST, None),
+        ];
+        for (uri, expected, allow) in cases {
+            let response = request_with_body(
+                make_ingest_router(dir.path()),
+                Method::POST,
+                uri,
+                &[],
+                Body::from("content"),
+            )
+            .await;
+            assert_eq!(response.status(), expected, "{uri}");
+            assert_eq!(header(&response, "allow"), allow, "{uri}");
+        }
+
+        let digest_response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            &format!("/pcas/{digest}"),
+            &[],
+            Body::from("content"),
+        )
+        .await;
+        assert_eq!(digest_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(header(&digest_response, "allow"), Some("GET, HEAD"));
+
+        let unsupported =
+            request(make_ingest_router(dir.path()), Method::PUT, "/new.bin", &[]).await;
+        assert_eq!(unsupported.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(header(&unsupported, "allow"), Some("GET, HEAD, POST"));
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_symlink_parent_escape() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/escape/file.bin",
+            &[],
+            Body::from("secret"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!outside.path().join("file.bin").exists());
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_symlinked_internal_object_directory() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".pcas")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".pcas/sha256")).unwrap();
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/safe.bin",
+            &[],
+            Body::from("content"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!dir.path().join("safe.bin").exists());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn body_stream_error_removes_temp_and_never_publishes() {
+        let dir = TempDir::new().unwrap();
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("disconnected")),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/incomplete.bin",
+            &[],
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!dir.path().join("incomplete.bin").exists());
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn index_lock_timeout_is_retryable_without_visible_publication() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".pcas")).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join(".pcas/index.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/waiting.bin",
+            &[],
+            Body::from("not yet published"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&response, "retry-after"), Some("1"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(payload["error"], "index_lock_timeout");
+        assert_eq!(payload["published"], false);
+        assert_eq!(payload["retry"], true);
+        assert!(!dir.path().join("waiting.bin").exists());
+        assert!(!dir.path().join(".pcas/sha256").exists());
+        assert_ingest_tmp_empty(dir.path());
+    }
+
+    #[tokio::test]
+    async fn index_failure_does_not_publish_visible_file() {
+        let dir = TempDir::new().unwrap();
+        let corrupt_shard = dir.path().join(".pcas/sha256/aa");
+        std::fs::create_dir_all(&corrupt_shard).unwrap();
+        std::fs::write(corrupt_shard.join("not-an-object"), b"corrupt").unwrap();
+
+        let response = request_with_body(
+            make_ingest_router(dir.path()),
+            Method::POST,
+            "/failed.bin",
+            &[],
+            Body::from("must not publish"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!dir.path().join("failed.bin").exists());
+        assert_ingest_tmp_empty(dir.path());
     }
 
     #[tokio::test]
