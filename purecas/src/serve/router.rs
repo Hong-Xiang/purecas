@@ -7,6 +7,7 @@ use crate::serve::digest;
 use crate::serve::ingest::{self, IngestError};
 use crate::serve::listing;
 use crate::serve::path::{self, PathError, VisiblePath};
+use crate::serve::process::{ProcessRoutes, RouteLookup};
 use crate::serve::representation::Representation;
 use crate::serve::resolve::{self, Resolved, Root};
 use crate::serve::respond;
@@ -28,6 +29,7 @@ use std::sync::Arc;
 pub struct AppState {
     root: Root,
     ingestion: IngestionMode,
+    process_routes: Option<ProcessRoutes>,
 }
 
 impl AppState {
@@ -35,11 +37,28 @@ impl AppState {
         Self {
             root,
             ingestion: IngestionMode::ReadOnly,
+            process_routes: None,
         }
     }
 
     pub fn with_ingestion(root: Root, ingestion: IngestionMode) -> Self {
-        Self { root, ingestion }
+        Self {
+            root,
+            ingestion,
+            process_routes: None,
+        }
+    }
+
+    pub fn with_options(
+        root: Root,
+        ingestion: IngestionMode,
+        process_routes: Option<ProcessRoutes>,
+    ) -> Self {
+        Self {
+            root,
+            ingestion,
+            process_routes,
+        }
     }
 }
 
@@ -77,9 +96,48 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
         };
     }
 
+    let process_path = if state.process_routes.is_some() {
+        match path::parse(&raw_path) {
+            Ok(parsed) => Some(parsed),
+            Err(PathError::MalformedPercentEncoding | PathError::Nul) if method == Method::POST => {
+                return bad_request()
+            }
+            Err(PathError::Invalid | PathError::ReservedTopLevel | PathError::LegacyDatabase)
+                if method == Method::POST =>
+            {
+                return not_found()
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let process_match = match (&state.process_routes, &process_path) {
+        (Some(routes), Some(path)) => routes.lookup(path),
+        _ => RouteLookup::None,
+    };
+    if method == Method::POST {
+        match process_match {
+            RouteLookup::Matched(matched) => {
+                return crate::serve::process::dispatch(matched, req).await
+            }
+            RouteLookup::InvalidCapture => return not_found(),
+            RouteLookup::None => {}
+        }
+    }
+
     let is_ingest = method == Method::POST && state.ingestion == IngestionMode::Allow;
     if !matches!(method, Method::GET | Method::HEAD) && !is_ingest {
-        return method_not_allowed(state.ingestion == IngestionMode::Allow);
+        return method_not_allowed(
+            state.ingestion == IngestionMode::Allow
+                || state
+                    .process_routes
+                    .as_ref()
+                    .zip(process_path.as_ref())
+                    .is_some_and(|(routes, path)| {
+                        !matches!(routes.lookup(path), RouteLookup::None)
+                    }),
+        );
     }
 
     let parsed = match path::parse(&raw_path) {
@@ -363,7 +421,10 @@ mod tests {
     use super::*;
     use axum::body::Bytes;
     use http_body_util::BodyExt;
+    use std::ffi::OsString;
     use std::fs::OpenOptions;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -377,6 +438,67 @@ mod tests {
         router(Arc::new(AppState::with_ingestion(
             root,
             IngestionMode::Allow,
+        )))
+    }
+
+    fn process_fixture() -> &'static Path {
+        static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let output = std::env::temp_dir().join(format!(
+                    "purecas-process-router-fixture-{}",
+                    std::process::id()
+                ));
+                let source =
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process_fixture.rs");
+                let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+                let status = std::process::Command::new(rustc)
+                    .arg(&source)
+                    .arg("-O")
+                    .arg("-o")
+                    .arg(&output)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                output
+            })
+            .as_path()
+    }
+
+    fn process_routes(
+        path: &str,
+        args: &[&str],
+        max_request_bytes: u64,
+        max_concurrency: usize,
+    ) -> ProcessRoutes {
+        let args = args
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ProcessRoutes::parse(&format!(
+            r#"
+[[process_routes]]
+path = {path:?}
+executable = {executable:?}
+args = [{args}]
+request_content_type = "application/octet-stream"
+response_content_type = "application/octet-stream"
+max_request_bytes = {max_request_bytes}
+max_concurrency = {max_concurrency}
+timeout_seconds = 5
+"#,
+            executable = process_fixture().to_string_lossy(),
+        ))
+        .unwrap()
+    }
+
+    fn make_process_router(root: &Path, routes: ProcessRoutes, ingestion: IngestionMode) -> Router {
+        let root = Root::open(root).unwrap();
+        router(Arc::new(AppState::with_options(
+            root,
+            ingestion,
+            Some(routes),
         )))
     }
 
@@ -1338,6 +1460,152 @@ mod tests {
             StatusCode::OK
         );
         assert!(!dir.path().join("purecas.db").exists());
+    }
+
+    // --- configured process routes -------------------------------------
+
+    #[tokio::test]
+    async fn process_post_precedes_ingestion_while_get_remains_hierarchy() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("run")).unwrap();
+        std::fs::write(dir.path().join("run/7"), b"stored hierarchy bytes").unwrap();
+        let routes = process_routes("/run/{stream:u32}", &["argv", "{stream}"], 16, 1);
+        let app = make_process_router(dir.path(), routes, IngestionMode::Allow);
+
+        let processed = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/run/7",
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(processed.status(), StatusCode::OK);
+        assert_eq!(
+            header(&processed, "content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(body_bytes(processed).await, b"7\n");
+
+        let encoded = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/%72un/7",
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(encoded.status(), StatusCode::OK);
+        assert_eq!(body_bytes(encoded).await, b"7\n");
+
+        let stored = get(app, "/run/7").await;
+        assert_eq!(stored.status(), StatusCode::OK);
+        assert_eq!(body_bytes(stored).await, b"stored hierarchy bytes");
+    }
+
+    #[tokio::test]
+    async fn process_route_enforces_mime_method_and_typed_capture() {
+        let dir = TempDir::new().unwrap();
+        let routes = process_routes("/run/{stream:u32}", &["argv", "{stream}"], 16, 1);
+        let app = make_process_router(dir.path(), routes, IngestionMode::Allow);
+
+        let wrong_mime = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/run/7",
+            &[("content-type", "text/plain")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(wrong_mime.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let missing_mime =
+            request_with_body(app.clone(), Method::POST, "/run/7", &[], Body::empty()).await;
+        assert_eq!(missing_mime.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let invalid_capture = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/run/01",
+            &[("content-type", "application/octet-stream")],
+            Body::from("must not become a file"),
+        )
+        .await;
+        assert_eq!(invalid_capture.status(), StatusCode::NOT_FOUND);
+        assert!(!dir.path().join("run/01").exists());
+        let encoded_invalid = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/run/%30%31",
+            &[("content-type", "application/octet-stream")],
+            Body::from("must not become a file"),
+        )
+        .await;
+        assert_eq!(encoded_invalid.status(), StatusCode::NOT_FOUND);
+
+        let put = request(app, Method::PUT, "/run/7", &[]).await;
+        assert_eq!(put.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(header(&put, "allow"), Some("GET, HEAD, POST"));
+    }
+
+    #[tokio::test]
+    async fn process_route_content_length_and_concurrency_fail_promptly() {
+        let dir = TempDir::new().unwrap();
+        let routes = process_routes("/run", &["descendant"], 4, 1);
+        let app = make_process_router(dir.path(), routes, IngestionMode::ReadOnly);
+
+        let too_large = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/run",
+            &[
+                ("content-type", "application/octet-stream"),
+                ("content-length", "5"),
+            ],
+            Body::from("12345"),
+        )
+        .await;
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let active = request_with_body(
+            app.clone(),
+            Method::POST,
+            "/run",
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(active.status(), StatusCode::OK);
+
+        let saturated = request_with_body(
+            app,
+            Method::POST,
+            "/run",
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&saturated, "retry-after"), Some("1"));
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn process_route_rejects_http_1_0_before_spawn() {
+        let dir = TempDir::new().unwrap();
+        let routes = process_routes("/run", &["argv", "never-spawned"], 4, 1);
+        let app = make_process_router(dir.path(), routes, IngestionMode::ReadOnly);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/run")
+            .version(http::Version::HTTP_10)
+            .header("content-type", "application/octet-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::HTTP_VERSION_NOT_SUPPORTED);
     }
 
     // --- digest route: identity, headers, normalization, errors --------
